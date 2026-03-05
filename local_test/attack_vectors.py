@@ -95,12 +95,6 @@ def _make_torch_stub() -> types.ModuleType:
     return torch
 
 
-def _make_transformers_stub() -> types.ModuleType:
-    transformers = types.ModuleType("transformers")
-    transformers.__getattr__ = lambda _name: _Dummy()
-    return transformers
-
-
 def _make_crusades_overrides(security_defs) -> dict[str, object]:
     crusades_pkg = types.ModuleType("crusades")
     core_pkg = types.ModuleType("crusades.core")
@@ -113,22 +107,8 @@ def _make_crusades_overrides(security_defs) -> dict[str, object]:
     }
 
 
-def _load_verify_validate():
-    security_defs = _load_security_defs()
-    torch_stub = _make_torch_stub()
-    overrides = {
-        **_make_crusades_overrides(security_defs),
-        "torch": torch_stub,
-        "torch.nn": torch_stub.nn,
-        "torch.nn.functional": torch_stub.nn.functional,
-        "transformers": _make_transformers_stub(),
-    }
-    with _patched_modules(overrides):
-        verify_module = _load_module("verify_under_test", ROOT / "local_test/verify.py")
-    return verify_module.validate_code_structure
-
-
-def _load_env_validate():
+def _load_scanner():
+    """Load env.py's _validate_code_structure (the production scanner)."""
     security_defs = _load_security_defs()
     torch_stub = _make_torch_stub()
     overrides = {
@@ -145,29 +125,42 @@ def _load_env_validate():
     return env_module._validate_code_structure
 
 
-def _verify_security_blocked(validate_code_structure, code: str) -> tuple[bool, str]:
-    violations = validate_code_structure(code)
-    security_violations = [v for v in violations if "inner_steps" not in v]
-    if security_violations:
-        return True, security_violations[0]
-    return False, "No security violation (only structural checks or full pass)"
+_STRUCTURAL_FAILURES = {
+    "Missing required function: inner_steps",
+}
 
 
-def _env_security_blocked(validate_code_structure, code: str) -> tuple[bool, str]:
+def _security_blocked(validate_code_structure, code: str) -> tuple[bool, str]:
     safe, message = validate_code_structure(code)
     reason = message or ("No validation message" if safe else "Validation failed without message")
+    if not safe and message in _STRUCTURAL_FAILURES:
+        return False, f"(structural) {message}"
     blocked = not safe
     return blocked, reason
 
 
-def _bypass_cases() -> list[tuple[str, str]]:
-    cases = []
+MULTI_GPU_RELAXED: set[str] = {
+    "functools",
+    "torch.distributed",
+    "torch.multiprocessing",
+    "type",
+    "__class__",
+}
+
+
+def _bypass_cases() -> list[tuple[str, str, bool]]:
+    """Return (name, code, expect_blocked) triples.
+
+    Cases with expect_blocked=False are intentionally allowed for multi-GPU
+    support and should NOT trigger the scanner.
+    """
+    cases: list[tuple[str, str, bool]] = []
     n = 0
 
-    def add(name, code):
+    def add(name, code, *, expect_blocked=True):
         nonlocal n
         n += 1
-        cases.append((f"{n}. {name}", code))
+        cases.append((f"{n}. {name}", code, expect_blocked))
 
     # === __name__ BINDING VECTORS ===
     add("MatchAs binding", "match '__main__':\n    case __name__:\n        pass\n")
@@ -286,12 +279,12 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("import builtins", "import builtins\n")
     add("import operator", "import operator\n")
     add("import types", "import types\n")
-    add("import functools", "import functools\n")
+    add("import functools", "import functools\n", expect_blocked=False)
     add("import weakref", "import weakref\n")
     add("import logging", "import logging\n")
     add("from os import path", "from os import path\n")
     add("import unittest.mock", "import unittest.mock\n")
-    add("Dotted torch.distributed", "import torch.distributed\n")
+    add("Dotted torch.distributed", "import torch.distributed\n", expect_blocked=False)
     add("import _thread", "import _thread\n")
     add("import multiprocessing", "import multiprocessing\n")
     add("import signal", "import signal\n")
@@ -309,7 +302,11 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("import io", "import io\n")
     add("import http", "import http\n")
     add("import urllib", "import urllib\n")
-    add("from torch.multiprocessing import spawn", "from torch.multiprocessing import spawn\n")
+    add(
+        "from torch.multiprocessing import spawn",
+        "from torch.multiprocessing import spawn\n",
+        expect_blocked=False,
+    )
     add("import numpy.ctypeslib", "import numpy.ctypeslib\n")
 
     # === FORBIDDEN BUILTINS / NAMES ===
@@ -325,7 +322,7 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("open() reference", "f = open\n")
     add("vars() reference", "f = vars\n")
     add("dir() reference", "f = dir\n")
-    add("type() reference", "f = type\n")
+    add("type() reference", "f = type\n", expect_blocked=False)
     add("memoryview() reference", "f = memoryview\n")
     add("chr() reference", "f = chr\n")
     add("ord() reference", "f = ord\n")
@@ -360,7 +357,7 @@ def _bypass_cases() -> list[tuple[str, str]]:
     add("__bases__ attribute", "import torch\nx = torch.__bases__\n")
     add("__mro__ attribute", "import torch\nx = torch.__mro__\n")
     add("__init_subclass__ attribute", "import torch\nx = torch.__init_subclass__\n")
-    add("__class__ string literal", 'x = "__class__"\n')
+    add("__class__ string literal", 'x = "__class__"\n', expect_blocked=False)
     add("__setattr__ string literal", 'x = "__setattr__"\n')
     add("__delattr__ string literal", 'x = "__delattr__"\n')
     add("__import__ string literal", 'x = "__import__"\n')
@@ -504,51 +501,98 @@ def _bypass_cases() -> list[tuple[str, str]]:
         "x = bytearray([95, 95, 103, 108, 111, 98, 97, 108, 115, 95, 95]).decode()\n",
     )
 
+    # === MULTI-GPU RELAXATION ABUSE ===
+    # These try to weaponize the modules/builtins that were unblocked for multi-GPU.
+    # The imports themselves are allowed, but using them for forbidden operations must
+    # still be caught by other layers of the scanner.
+    add(
+        "torch.distributed + exec via string",
+        'import torch.distributed\nexec("import os")\n',
+    )
+    add(
+        "functools + globals() access",
+        "import functools\ng = globals()\n",
+    )
+    add(
+        "functools.partial wrapping eval",
+        "import functools\nf = functools.partial(eval, '1+1')\n",
+    )
+    add(
+        "type() + __bases__ escape",
+        "t = type.__bases__\n",
+    )
+    add(
+        "type() + __subclasses__ escape",
+        "t = type.__subclasses__\n",
+    )
+    add(
+        "__class__.__bases__ escape",
+        "class X:\n    b = X.__class__.__bases__\n",
+    )
+    add(
+        "__class__.__mro__ escape",
+        "class X:\n    m = X.__class__.__mro__\n",
+    )
+    add(
+        "torch.multiprocessing + os import",
+        "from torch.multiprocessing import spawn\nimport os\n",
+    )
+    add(
+        "torch.distributed + inspect import",
+        "import torch.distributed\nimport inspect\n",
+    )
+    add(
+        "functools + __import__",
+        "import functools\n__import__('os')\n",
+    )
+
     return cases
 
 
 def main() -> int:
-    verify_validate = _load_verify_validate()
-    env_validate = _load_env_validate()
+    scanner = _load_scanner()
 
     print("=" * 60)
     print("  Templar Crusades — Security Scanner Regression Suite")
+    print("  (tests env.py production scanner used by simulate_validator)")
     print("=" * 60)
 
-    failed_cases = 0
+    failures: list[str] = []
     total_checks = 0
-    bypassed: list[str] = []
+    relaxed_count = 0
 
-    for case_name, case_code in _bypass_cases():
-        verify_blocked, verify_reason = _verify_security_blocked(verify_validate, case_code)
-        env_blocked, env_reason = _env_security_blocked(env_validate, case_code)
-        total_checks += 2
+    for case_name, case_code, expect_blocked in _bypass_cases():
+        blocked, reason = _security_blocked(scanner, case_code)
+        total_checks += 1
 
-        verify_status = "\033[32mBLOCKED\033[0m" if verify_blocked else "\033[31mBYPASSED\033[0m"
-        env_status = "\033[32mBLOCKED\033[0m" if env_blocked else "\033[31mBYPASSED\033[0m"
+        if expect_blocked:
+            ok = blocked
+            status = "\033[32mBLOCKED\033[0m" if ok else "\033[31mBYPASSED\033[0m"
+            print(f"\n  [{case_name}]")
+            print(f"    {status} | {reason}")
+            if not ok:
+                failures.append(case_name)
+        else:
+            relaxed_count += 1
+            ok = not blocked
+            status = "\033[36mALLOWED\033[0m" if ok else "\033[33mBLOCKED (unexpected)\033[0m"
+            print(f"\n  [{case_name}] (multi-GPU relaxation)")
+            print(f"    {status} | {reason}")
+            if not ok:
+                failures.append(f"{case_name} — should be allowed")
 
-        print(f"\n  [{case_name}]")
-        print(f"    verify.py: {verify_status} | {verify_reason}")
-        print(f"    env.py:    {env_status} | {env_reason}")
-
-        if not verify_blocked:
-            failed_cases += 1
-            bypassed.append(f"{case_name} (verify.py)")
-        if not env_blocked:
-            failed_cases += 1
-            bypassed.append(f"{case_name} (env.py)")
-
-    passed_checks = total_checks - failed_cases
+    passed = total_checks - len(failures)
     print("\n" + "=" * 60)
-    print(f"  Result: {passed_checks}/{total_checks} checks passed")
-    if bypassed:
-        print(f"\n  \033[31mBYPASSED ({len(bypassed)}):\033[0m")
-        for b in bypassed:
-            print(f"    - {b}")
+    print(f"  Result: {passed}/{total_checks} checks passed")
+    print(f"  ({relaxed_count} cases intentionally allowed for multi-GPU)")
+    if failures:
+        print(f"\n  \033[31mFAILURES ({len(failures)}):\033[0m")
+        for f in failures:
+            print(f"    - {f}")
     else:
-        print("\n  \033[32mAll attack vectors blocked.\033[0m")
+        print("\n  \033[32mAll attack vectors pass.\033[0m")
     print("=" * 60)
-    return 0 if failed_cases == 0 else 1
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":

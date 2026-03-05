@@ -160,9 +160,9 @@ class Validator(BaseNode):
             mode=self.affinetes_mode,
             basilica_api_key=os.getenv("BASILICA_API_TOKEN"),
             # Docker config
-            docker_gpu_devices=hparams.docker.gpu_devices,
             docker_memory_limit=hparams.docker.memory_limit,
             docker_shm_size=hparams.docker.shm_size,
+            num_gpus=hparams.docker.num_gpus,
             # Benchmark config
             model_url=hparams.benchmark_model_name,
             data_url=hparams.benchmark_dataset_name,
@@ -199,7 +199,7 @@ class Validator(BaseNode):
         logger.info(f"   Model: {hparams.benchmark_model_name}")
         logger.info(f"   Dataset: {hparams.benchmark_dataset_name}")
         if self.affinetes_mode == "docker":
-            logger.info(f"   Docker GPU devices: {hparams.docker.gpu_devices}")
+            logger.info(f"   Docker num_gpus: {hparams.docker.num_gpus}")
             logger.info(f"   Docker memory limit: {hparams.docker.memory_limit}")
             logger.info(f"   Docker shm size: {hparams.docker.shm_size}")
         elif self.affinetes_mode == "basilica":
@@ -321,12 +321,6 @@ class Validator(BaseNode):
             logger.debug("Payment verification disabled in hparams")
             return True
 
-        if commitment.hotkey in hparams.payment.skip_payment_hotkeys:
-            logger.info(
-                f"Skipping payment for {commitment.hotkey[:16]}... (in skip_payment_hotkeys)"
-            )
-            return True
-
         if self.chain is None:
             logger.error("No chain connection — cannot verify payment")
             return False
@@ -356,8 +350,10 @@ class Validator(BaseNode):
                 miner_coldkey = get_hotkey_owner(
                     archive_sub, commitment.hotkey, block=commitment.payment_block
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    f"Historical hotkey lookup failed at block {commitment.payment_block}: {e}"
+                )
         if miner_coldkey is None:
             miner_coldkey = get_hotkey_owner(archive_sub, commitment.hotkey)
         if miner_coldkey is None:

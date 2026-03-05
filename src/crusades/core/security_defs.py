@@ -1,10 +1,10 @@
 """
 Shared security policy constants and detection helpers for miner code validation.
 
-Single source of truth consumed by both the production validator
-(environments/templar/env.py) and the local pre-submission checker
-(local_test/verify.py).  Any additions or removals should be made
-here so the two stay in sync automatically.
+Single source of truth consumed by the production validator
+(environments/templar/env.py) and the local simulator
+(local_test/simulate_validator.py).  Any additions or removals
+should be made here so everything stays in sync automatically.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ FORBIDDEN_STRINGS: list[str] = [
     # Dunder escape hatches
     "__setattr__",
     "__delattr__",
-    "__class__",
+    # "__class__" — allowed: miners need obj.__class__ for FSDP layer detection
     "__subclasses__",
     "__bases__",
     "__mro__",
@@ -187,17 +187,16 @@ FORBIDDEN_MODULES: set[str] = {
     # unittest.mock.patch can replace any attribute on any object
     "unittest",
     "mock",
-    # functools.partial can wrap forbidden functions
-    "functools",
+    # functools.partial can wrap forbidden functions — ALLOWED: miners need
+    # functools.partial for FSDP auto_wrap_policy and similar optimisations.
+    # "functools",
     # weakref can observe GC behavior and hold references
     "weakref",
 }
 
 # Dotted module paths blocked even when the base module is allowed
 FORBIDDEN_DOTTED_MODULES: set[str] = {
-    "torch.multiprocessing",
     "torch.utils.dlpack",
-    "torch.distributed",
     "numpy.ctypeslib",
 }
 
@@ -257,7 +256,7 @@ FORBIDDEN_NAMES: set[str] = {
     "dir",
     "globals",
     "locals",
-    "type",
+    # "type" — allowed: miners need type() for FSDP auto_wrap_policy layer detection
     "memoryview",
     "open",
     "chr",
@@ -279,7 +278,7 @@ FORBIDDEN_BUILTINS: set[str] = {
     "dir",
     "globals",
     "locals",
-    "type",
+    # "type" — allowed: miners need type() for FSDP auto_wrap_policy layer detection
     "memoryview",
     "open",
     "chr",
@@ -337,9 +336,18 @@ FORBIDDEN_ASSIGNMENT_ATTRS: set[str] = {
 ALLOWED_TORCH_SUBMODULE_IMPORTS: set[str] = {
     "torch.nn",
     "torch.nn.functional",
+    "torch.nn.parallel",
     "torch.amp",
     "torch.cuda",
     "torch.cuda.amp",
+    "torch.distributed",
+    "torch.distributed.fsdp",
+    "torch.distributed.fsdp.wrap",
+    "torch.distributed.tensor",
+    "torch.distributed.tensor.parallel",
+    "torch.distributed.device_mesh",
+    "torch.distributed.optim",
+    "torch.utils.checkpoint",
 }
 
 # Prefixes of ``torch.*`` dotted paths where attribute *assignment* is
@@ -426,8 +434,8 @@ FORBIDDEN_INTROSPECTION_ATTRS: set[str] = {
 # ---------------------------------------------------------------------------
 # Shared AST detection helpers
 # ---------------------------------------------------------------------------
-# Used by both env.py and verify.py so detection logic is maintained in one
-# place.  Scanners import these and call them during AST walks.
+# Used by env.py so detection logic is maintained in one place.
+# Scanners import these and call them during AST walks.
 
 
 def forbidden_name_binding_reason(node: ast.AST) -> str | None:

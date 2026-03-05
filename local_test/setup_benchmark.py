@@ -129,7 +129,7 @@ def main():
 
     # Load config
     hparams = load_hparams()
-    model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-3B")
+    model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-7B")
     dataset_name = hparams.get("benchmark_dataset_name", "HuggingFaceFW/fineweb")
     num_samples = hparams.get("benchmark_data_samples", 10000)
     sequence_length = hparams.get("benchmark_sequence_length", 1024)
@@ -169,16 +169,10 @@ def main():
     print("SETUP COMPLETE")
     print("=" * 60)
     print()
-    print("Running verification (local_test/verify.py)...")
+    print("To verify your train.py, run the Docker-based simulator:")
     print()
-
-    import subprocess
-
-    result = subprocess.run(
-        [sys.executable, str(project_root / "local_test" / "verify.py")],
-        cwd=str(project_root),
-    )
-    sys.exit(result.returncode)
+    print("  See local_test/simulate_validator.py for usage instructions.")
+    print()
 
 
 if __name__ == "__main__":

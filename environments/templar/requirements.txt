@@ -1,19 +1,17 @@
 # Templar TPS Evaluation Environment Dependencies
-# Installed in validator's Docker image (templar-eval)
+# torch 2.9.0+cu126 is pre-installed in the base image
 
-# Core ML (torch 2.7.0+cu126 is pre-installed in the base image)
 transformers==4.57.6
 accelerate==1.12.0
 safetensors==0.7.0
-datasets==4.5.0
-
-# HTTP Server (for Basilica custom Docker deployment)
-fastapi==0.129.0
+datasets==4.6.0
+fastapi==0.133.1
 uvicorn==0.41.0
 pydantic==2.12.5
-
-# AWS SDK (may be needed for HuggingFace model downloads in some environments)
 boto3==1.42.54
-
-# Utilities
 numpy==2.2.6
+
+# Pinned transitive deps that affect eval determinism
+tokenizers==0.22.2
+huggingface-hub==0.36.0
+pyarrow==23.0.1

@@ -29,9 +29,9 @@ class VerificationConfig(BaseModel):
     """Verification settings using gradient and weight-based checks."""
 
     max_loss_difference: float = 0.3
-    min_params_changed_ratio: float = 0.8
+    min_params_changed_ratio: float = 0.7
     gradient_norm_ratio_max: float = 1.08
-    weight_relative_error_max: float = 0.006
+    weight_relative_error_max: float = 0.01
     timer_divergence_threshold: float = 0.005
 
 
@@ -40,7 +40,7 @@ class MFUConfig(BaseModel):
 
     gpu_peak_tflops: float = 312.0  # A100 80GB peak TFLOPS (bfloat16)
     max_plausible_mfu: float = 75.0  # Reject MFU above this as likely cheating
-    min_mfu: float = 50.0  # Reject submissions below this floor
+    min_mfu: float = 35.0  # Reject submissions below this floor
 
 
 class AdaptiveThresholdConfig(BaseModel):
@@ -51,7 +51,7 @@ class AdaptiveThresholdConfig(BaseModel):
     - Decays over time towards base_threshold (loses decay_percent each interval)
     """
 
-    base_threshold: float = 0.02  # Minimum threshold (2%)
+    base_threshold: float = 0.002  # Minimum threshold (0.2%)
     decay_percent: float = 0.05  # Percent to lose per interval (5% = loses 5% of excess)
     decay_interval_blocks: int = 100  # Blocks between decay steps (~20 min)
 
@@ -73,7 +73,6 @@ class PaymentConfig(BaseModel):
     enabled: bool = False
     fee_rao: int = 100_000_000  # 0.1 TAO in RAO (1 TAO = 1e9 RAO)
     payment_address: str = ""  # Explicit SS58 coldkey; empty = derive from burn_uid
-    skip_payment_hotkeys: list[str] = []  # Hotkeys exempt from payment (e.g., validator's own)
     rpc_timeout: int = 30  # Seconds before an RPC call is considered hung
     rpc_retries: int = 2  # Retry count for transient RPC failures
     archive_endpoint: str = "wss://archive.chain.opentensor.ai:443"
@@ -93,16 +92,9 @@ class PaymentConfig(BaseModel):
 
 
 class DockerConfig(BaseModel):
-    """Docker execution settings for validator evaluations.
+    """Docker execution settings for validator evaluations."""
 
-    GPU device options:
-    - "all": Use all available GPUs (default)
-    - "0": Use only GPU 0
-    - "0,1": Use GPUs 0 and 1
-    - "none": Disable GPU (CPU only)
-    """
-
-    gpu_devices: str = "all"  # "all", "0", "0,1", "none"
+    num_gpus: int = Field(default=1, ge=0)  # >1 uses torchrun for multi-GPU
     memory_limit: str = "32g"  # Docker memory limit
     shm_size: str = "8g"  # Shared memory size (important for PyTorch)
 
