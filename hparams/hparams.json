@@ -8,13 +8,13 @@
     "eval_timeout": 3600,
     "min_success_rate": 0.5,
 
-    "benchmark_model_name": "Qwen/Qwen2.5-7B",
+    "benchmark_model_name": "Qwen/Qwen2.5-3B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",
     "benchmark_data_samples": 10000,
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
-    "benchmark_batch_size": 16,
+    "benchmark_batch_size": 32,
 
     "set_weights_interval_blocks": 100,
     "reveal_blocks": 20,

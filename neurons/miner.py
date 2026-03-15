@@ -383,7 +383,8 @@ def commit_to_chain(
     # Format: "<32hex>:<block>:<index>:<url>" (payment) or "<32hex>:<url>" (no payment)
     # Use actual current_block to estimate block digits; add 1 digit of headroom for index.
     max_commitment = 128
-    if hparams.payment.enabled:
+    is_burn_uid = uid == hparams.burn_uid  # subnet operator — exempt from fees
+    if hparams.payment.enabled and not is_burn_uid:
         block_digits = len(str(current_block)) + 1  # +1 for power-of-10 rollover
         index_digits = 3  # extrinsic index rarely exceeds 999
         overhead = len(code_hash) + 1 + block_digits + 1 + index_digits + 1
@@ -398,7 +399,10 @@ def commit_to_chain(
         )
 
     # --- Payment step ---
-    if hparams.payment.enabled:
+    if is_burn_uid:
+        print(f"\n   Submitting as burn_uid {hparams.burn_uid} — payment exempt.")
+        pay_result_dict = None
+    elif hparams.payment.enabled:
         fee_rao = hparams.payment.fee_rao
 
         # Use explicit payment_address if configured, otherwise derive from burn_uid

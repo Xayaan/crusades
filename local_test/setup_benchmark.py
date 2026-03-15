@@ -129,7 +129,7 @@ def main():
 
     # Load config
     hparams = load_hparams()
-    model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-7B")
+    model_name = hparams.get("benchmark_model_name", "Qwen/Qwen2.5-3B")
     dataset_name = hparams.get("benchmark_dataset_name", "HuggingFaceFW/fineweb")
     num_samples = hparams.get("benchmark_data_samples", 10000)
     sequence_length = hparams.get("benchmark_sequence_length", 1024)

@@ -60,7 +60,7 @@ echo "HF_TOKEN=hf_your_token" > .env
 uv run local_test/setup_benchmark.py
 ```
 
-> **Hardware requirement:** The benchmark model (Qwen2.5-7B) needs ~130 GB for params + optimizer + gradients, which exceeds a single A100 80 GB. You need **2x A100 80 GB** with a memory-sharding strategy (FSDP or TP). Single-GPU and DDP will OOM.
+> **Hardware requirement:** The benchmark uses 2x A100 80 GB GPUs. The model (Qwen2.5-3B) fits on a single GPU, so DDP, FSDP, and TP strategies are all viable.
 
 ### Simulate the Validator (Recommended)
 
@@ -246,7 +246,7 @@ Key settings in `hparams/hparams.json`:
 | `netuid` | 3 | Subnet ID |
 | `evaluation_runs` | 3 | Runs per submission (median taken) |
 | `eval_steps` | 5 | Training steps per evaluation |
-| `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
+| `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
 | `benchmark_batch_size` | 16 | Batch size for evaluation |
 | `docker.num_gpus` | 2 | Number of GPUs (multi-GPU via `torchrun`) |
 

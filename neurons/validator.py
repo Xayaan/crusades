@@ -312,6 +312,9 @@ class Validator(BaseNode):
         (block + index) for O(1) direct on-chain lookup.  Commitments
         without the reference are rejected.
 
+        burn_uid is exempt from payment — it is the subnet operator's own
+        UID and cannot be claimed by external miners.
+
         Returns:
             True if payment verified (or payments disabled), False otherwise
         """
@@ -319,6 +322,13 @@ class Validator(BaseNode):
 
         if not hparams.payment.enabled:
             logger.debug("Payment verification disabled in hparams")
+            return True
+
+        if commitment.uid == hparams.burn_uid:
+            logger.info(
+                f"Skipping payment for burn_uid {hparams.burn_uid} "
+                f"(hotkey {commitment.hotkey[:16]}...)"
+            )
             return True
 
         if self.chain is None:
@@ -1074,7 +1084,13 @@ class Validator(BaseNode):
         await self._refresh_weight_block_from_chain()
 
         hparams = get_hparams()
-        current_block = self.commitment_reader.get_current_block()
+        try:
+            current_block = self.commitment_reader.get_current_block()
+        except (TimeoutError, OSError, ConnectionError) as e:
+            logger.warning(
+                f"Could not get current block for weight setting (will retry next loop): {e}"
+            )
+            return
         blocks_since_last = current_block - self.last_weight_set_block
         min_blocks = hparams.set_weights_interval_blocks
 

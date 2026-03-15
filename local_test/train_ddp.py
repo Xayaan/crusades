@@ -1,6 +1,6 @@
 # Reference: DDP (Distributed Data Parallel) strategy
 #
-# Uses micro-batch gradient accumulation to fit Qwen2.5-7B on A100-80GB.
+# Uses micro-batch gradient accumulation for Qwen2.5-3B on A100-80GB.
 # DDP replicates the full model per GPU — memory is tight (~77GB peak).
 # micro_batch=1 keeps activations small enough to leave headroom.
 #

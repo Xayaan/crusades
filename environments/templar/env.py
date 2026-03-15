@@ -1262,7 +1262,7 @@ def _verify_params_changed(
         initial_val = initial_state[name]
         if trained_val.shape != initial_val.shape:
             continue
-        element_diffs = (trained_val.float() - initial_val.float()).abs()
+        element_diffs = (trained_val.cpu().float() - initial_val.cpu().float()).abs()
         changed_mask = element_diffs > element_threshold
 
         total_elements += trained_val.numel()
@@ -1302,6 +1302,7 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
     if cached is not None and cached_path == model_path and cached_random_init == use_random_init:
         if _CACHE.get("initial_state"):
             cached.load_state_dict(_CACHE["initial_state"])
+            cached.to(torch.device(f"cuda:{_LOCAL_RANK}"))
         return cached
 
     model = _load_model(model_path, use_random_init=use_random_init)
@@ -1801,10 +1802,10 @@ def _verify_final_weights(
         if cand_val.shape != ref_param.shape:
             mismatched_layers += 1
             continue
-        diff = cand_val.float() - ref_param.float()
+        diff = cand_val.cpu().float() - ref_param.cpu().float()
 
         layer_diff_sq = (diff * diff).sum().item()
-        layer_ref_sq = (ref_param.float() * ref_param.float()).sum().item()
+        layer_ref_sq = (ref_param.cpu().float() * ref_param.cpu().float()).sum().item()
 
         diff_norm_sq += layer_diff_sq
         ref_norm_sq += layer_ref_sq
@@ -2281,6 +2282,7 @@ class Actor:
                 model = _load_model(model_url, use_random_init=use_random_init)
                 _CACHE["model"] = model
                 model.load_state_dict(initial_state)
+                model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
                 dist.barrier()
             elif _multi_gpu:
                 # TP strategy: rank 0 runs single-GPU reference, others wait.
@@ -2323,6 +2325,7 @@ class Actor:
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         model.load_state_dict(initial_state)
+                        model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
                     except Exception as e:
                         tp_ref_error = f"TP reference run failed on rank 0: {e}"
                         logger.error(tp_ref_error)
@@ -2383,6 +2386,7 @@ class Actor:
                     torch.cuda.empty_cache()
 
                 model.load_state_dict(initial_state)
+                model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
 
             # Capture vault timer refs into locals BEFORE loading miner code.
             # Closure variables inside the vault are immune to frame.f_globals
@@ -2595,8 +2599,10 @@ class Actor:
                 model = _load_model(model_url, use_random_init=use_random_init)
                 _CACHE["model"] = model
                 model.load_state_dict(initial_state)
+                model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
             else:
                 model.load_state_dict(initial_state)
+                model.to(torch.device(f"cuda:{_LOCAL_RANK}"))
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -3356,7 +3362,7 @@ asyncio.run(main())
         return {
             "task_id": request.task_id,
             "success": False,
-            "error": f"No EVAL_RESULT in torchrun output (exit {proc.returncode}): {stdout_text[:300]}",
+            "error": f"No EVAL_RESULT in torchrun output (exit {proc.returncode}): {stdout_text[-1000:]}",
             "seed": request.seed,
             "mfu": 0.0,
             "tps": 0.0,
