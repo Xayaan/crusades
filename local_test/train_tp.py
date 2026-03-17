@@ -65,6 +65,18 @@ def _gather_full_state(model):
         if hasattr(p, "full_tensor"):
             p = p.full_tensor()
         state[name] = p.detach().cpu().clone()
+    for name, buf in model.named_buffers():
+        b = buf.data
+        if hasattr(b, "full_tensor"):
+            b = b.full_tensor()
+        state[name] = b.detach().cpu().clone()
+    sd = model.state_dict()
+    for key in sd:
+        if key not in state:
+            val = sd[key]
+            if hasattr(val, "full_tensor"):
+                val = val.full_tensor()
+            state[key] = val.detach().cpu().clone()
     return state
 
 

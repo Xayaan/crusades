@@ -7,7 +7,7 @@
 # Requirements for verification:
 #   - get_strategy() -> "ddp"
 #   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
-#   - No final_state needed (validator reads weights directly from model)
+#   - Must return final_state with full model state_dict for weight verification
 #   - Each rank processes different data (data-parallel)
 
 from contextlib import nullcontext
@@ -91,8 +91,12 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         total_tokens += batch.numel()
         final_loss = step_loss_sum / num_accum
 
+    raw_model = model.module if hasattr(model, "module") else model
+    full_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+
     return InnerStepsResult(
         final_logits=final_logits,
         total_tokens=total_tokens,
         final_loss=final_loss,
+        final_state=full_state,
     )

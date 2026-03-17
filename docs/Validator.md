@@ -110,7 +110,7 @@ When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows m
 - `optimizer` will be `None` -- create your own after wrapping the model
 - Any parallelism strategy is allowed: DDP, FSDP, TP, PP, or combinations
 - `torch.distributed` process group is already initialized by `torchrun`
-- For FSDP/TP: return `final_state` (full unsharded `state_dict` on CPU) in `InnerStepsResult` for weight verification
+- Must return `final_state` (full `state_dict` on CPU) in `InnerStepsResult` for weight verification (required for all strategies in multi-GPU mode)
 - `device.index` gives the local rank (`os` module is forbidden)
 
 ### Adaptive Threshold & Leaderboard

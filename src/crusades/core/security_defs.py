@@ -53,6 +53,11 @@ FORBIDDEN_STRINGS: list[str] = [
     "__init_subclass__",
     "__traceback__",
     "__getattribute__",
+    "__getattr__",
+    # Descriptor protocol — enables lazy/deferred attribute access
+    "__get__",
+    "__set__",
+    "__delete__",
     "__build_class__",
     # Timer / profiling internals
     "perf_counter",
@@ -144,6 +149,10 @@ FORBIDDEN_STRINGS: list[str] = [
     "mock.patch",
     "MagicMock",
     "unittest.mock",
+    # Model config tampering — reduces computation while formula credits full work
+    "sliding_window",
+    "use_sliding_window",
+    "max_window_layers",
 ]
 
 # ---------------------------------------------------------------------------
@@ -345,6 +354,7 @@ FORBIDDEN_TIMER_ATTRS: set[str] = {
 FORBIDDEN_ASSIGNMENT_ATTRS: set[str] = {
     "synchronize",
     "elapsed_time",
+    "record",
 }
 
 # Allowed torch submodule import paths.  Only these may be imported via
@@ -440,6 +450,11 @@ FORBIDDEN_INTROSPECTION_ATTRS: set[str] = {
     "co_consts",
     "co_names",
     "__getattribute__",
+    "__getattr__",
+    # Descriptor protocol — enables lazy/deferred attribute access
+    "__get__",
+    "__set__",
+    "__delete__",
     # Generator / coroutine / async-generator frame access
     "gi_frame",
     "gi_code",

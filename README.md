@@ -183,7 +183,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 | `final_logits` | `torch.Tensor` | Logits from the last forward pass. Must be 3D `(batch, seq_len-1, vocab)`. Cannot be `None`. |
 | `total_tokens` | `int` | Total tokens processed across all steps (= `batch_size × seq_len × num_steps`). |
 | `final_loss` | `float` | Loss value from the last training step. Must be positive and not NaN. |
-| `final_state` | `dict` (optional) | For FSDP/TP: full unsharded `state_dict` on CPU. Required for weight verification in multi-GPU mode. Not needed for single-GPU or DDP. |
+| `final_state` | `dict` (required) | Full `state_dict` on CPU. **Required** for weight verification in multi-GPU mode (all strategies: DDP, FSDP, TP). For single-GPU, the validator can read weights directly. |
 
 ### Multi-GPU Example (FSDP)
 
@@ -226,7 +226,7 @@ See `local_test/train_fsdp.py` and `local_test/train_tp.py` for complete working
 - Don't alias `torch` (e.g., `import torch as t`) -- the scanner needs the literal name
 - In multi-GPU mode, `optimizer` is `None` -- create your own after wrapping the model
 - You may use any memory-sharding parallelism: FSDP, TP, PP, or combinations
-- For FSDP/TP: return gathered `final_state` (full unsharded CPU tensors) in `InnerStepsResult` for weight verification
+- Must return `final_state` (full CPU `state_dict`) in `InnerStepsResult` for weight verification (required for all strategies in multi-GPU mode)
 - Gradient verification is skipped in multi-GPU mode; the validator verifies via loss and final weight comparison
 
 A static security scanner blocks dangerous patterns (forbidden imports, monkey-patching, timer tampering, etc.). See [`src/crusades/core/security_defs.py`](src/crusades/core/security_defs.py) for the full blocklist. Run the Docker-based [`simulate_validator.py`](local_test/simulate_validator.py) before submitting to catch violations early.
