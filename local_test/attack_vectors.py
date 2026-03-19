@@ -440,7 +440,7 @@ def _bypass_cases() -> list[tuple[str, str, bool]]:
     # === OPTIMIZER INTERNALS ===
     add("_opt_impl string", 'x = "_opt_impl"\n')
     add("_grad_snapshot_gpu string", 'x = "_grad_snapshot_gpu"\n')
-    add("step_count string", 'x = "step_count"\n')
+    add("step_count string", 'x = "step_count"\n', expect_blocked=False)
 
     # === sys.modules ACCESS ===
     add("sys.modules string", 'x = "sys.modules"\n')

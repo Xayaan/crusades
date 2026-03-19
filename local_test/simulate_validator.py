@@ -27,7 +27,8 @@ same Docker container.
         templar-eval:latest \
         python3 /test/simulate.py
 
-   Replace train_ddp.py with train_fsdp.py or train_tp.py to test other strategies.
+   Replace train_ddp.py with train_fsdp.py, train_tp.py, or train_mixed.py to test
+   other strategies. train_mixed.py requires 4 GPUs (dp_size=2, tp_size=2).
 """
 
 import asyncio
@@ -81,7 +82,6 @@ def _build_payload(hb, code):
         "min_trainable_params_ratio": 1.0,
         "max_loss_difference": hb["verification"]["max_loss_difference"],
         "min_params_changed_ratio": hb["verification"]["min_params_changed_ratio"],
-        "gradient_norm_ratio_max": hb["verification"]["gradient_norm_ratio_max"],
         "weight_relative_error_max": hb["verification"]["weight_relative_error_max"],
         "timer_divergence_threshold": hb["verification"]["timer_divergence_threshold"],
         "gpu_peak_tflops": hb["mfu"]["gpu_peak_tflops"],
@@ -128,7 +128,6 @@ async def _simulate_single_gpu(payload):
         min_trainable_params_ratio=payload["min_trainable_params_ratio"],
         max_loss_difference=payload["max_loss_difference"],
         min_params_changed_ratio=payload["min_params_changed_ratio"],
-        gradient_norm_ratio_max=payload["gradient_norm_ratio_max"],
         weight_relative_error_max=payload["weight_relative_error_max"],
         timer_divergence_threshold=payload["timer_divergence_threshold"],
         gpu_peak_tflops=payload["gpu_peak_tflops"],
@@ -169,7 +168,6 @@ async def main():
         use_random_init=p["use_random_init"],
         min_trainable_params_ratio=p["min_trainable_params_ratio"],
         min_params_changed_ratio=p["min_params_changed_ratio"],
-        gradient_norm_ratio_max=p["gradient_norm_ratio_max"],
         weight_relative_error_max=p["weight_relative_error_max"],
         timer_divergence_threshold=p["timer_divergence_threshold"],
         gpu_peak_tflops=p["gpu_peak_tflops"],

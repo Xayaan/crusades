@@ -80,11 +80,10 @@ FORBIDDEN_STRINGS: list[str] = [
     "get_objects",
     "get_referrers",
     "get_referents",
-    # Validator optimizer internals
+    # Validator optimizer internals (legacy — kept to block probing)
     "captured_gradients",
     "_opt_impl",
     "_grad_snapshot_gpu",
-    "step_count",
     "GradientCapturingOptimizer",
     # Dynamic import / module access
     "importlib",

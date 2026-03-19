@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import subprocess
 import tempfile
 import time
@@ -165,10 +166,8 @@ class AffinetesRunner:
         # Verification settings
         max_loss_difference: float = 0.3,
         min_params_changed_ratio: float = 0.8,
-        # Gradient verification
-        gradient_norm_ratio_max: float = 1.08,
         # Weight verification
-        weight_relative_error_max: float = 0.006,
+        weight_relative_error_max: float = 0.008,
         # Timer integrity
         timer_divergence_threshold: float = 0.005,
         # MFU calculation
@@ -201,8 +200,7 @@ class AffinetesRunner:
             data_url: Default data URL (HuggingFace dataset)
             max_loss_difference: Max allowed |candidate_loss - reference_loss|
             min_params_changed_ratio: Min % params that must change
-            gradient_norm_ratio_max: Encoded as 1 + max_relative_error (e.g., 1.08 = 8%)
-            weight_relative_error_max: Max relative error for final weight check (e.g., 0.006 = 0.6%)
+            weight_relative_error_max: Max relative error for final weight check (e.g., 0.008 = 0.8%)
             timer_divergence_threshold: Max allowed divergence between timer sources (e.g., 0.005 = 0.5%)
             gpu_peak_tflops: GPU peak TFLOPS for MFU calculation
             max_plausible_mfu: Reject MFU above this threshold (anti-cheat)
@@ -227,8 +225,6 @@ class AffinetesRunner:
         # Verification settings
         self.max_loss_difference = max_loss_difference
         self.min_params_changed_ratio = min_params_changed_ratio
-        # Gradient verification
-        self.gradient_norm_ratio_max = gradient_norm_ratio_max
         # Weight verification
         self.weight_relative_error_max = weight_relative_error_max
         # Timer integrity
@@ -452,8 +448,6 @@ async def main():
         use_random_init=True,
         min_trainable_params_ratio=1.0,
         min_params_changed_ratio={self.min_params_changed_ratio},
-        # Gradient verification
-        gradient_norm_ratio_max={self.gradient_norm_ratio_max},
         # Weight verification
         weight_relative_error_max={self.weight_relative_error_max},
         # Timer integrity
@@ -553,12 +547,15 @@ asyncio.run(main())
 
             # Image and command
             if self.num_gpus > 1:
+                master_port = 29500 + secrets.randbelow(10001)
                 docker_cmd.extend(
                     [
                         self.validator_image,
                         "torchrun",
                         "--nproc_per_node",
                         str(self.num_gpus),
+                        "--master_port",
+                        str(master_port),
                         "/app/scripts/eval_script.py",
                     ]
                 )
@@ -791,8 +788,6 @@ asyncio.run(main())
                 "use_random_init": True,
                 "min_trainable_params_ratio": 1.0,
                 "min_params_changed_ratio": self.min_params_changed_ratio,
-                # Gradient verification
-                "gradient_norm_ratio_max": self.gradient_norm_ratio_max,
                 # Weight verification
                 "weight_relative_error_max": self.weight_relative_error_max,
                 # Timer integrity

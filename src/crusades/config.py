@@ -26,12 +26,11 @@ class StorageConfig(BaseModel):
 
 
 class VerificationConfig(BaseModel):
-    """Verification settings using gradient and weight-based checks."""
+    """Verification settings using weight-based checks."""
 
     max_loss_difference: float = 0.3
     min_params_changed_ratio: float = 0.7
-    gradient_norm_ratio_max: float = 1.08
-    weight_relative_error_max: float = 0.01
+    weight_relative_error_max: float = 0.008
     timer_divergence_threshold: float = 0.005
 
 

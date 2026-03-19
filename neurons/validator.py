@@ -169,8 +169,6 @@ class Validator(BaseNode):
             timeout=hparams.eval_timeout,
             max_loss_difference=hparams.verification.max_loss_difference,
             min_params_changed_ratio=hparams.verification.min_params_changed_ratio,
-            # Gradient verification
-            gradient_norm_ratio_max=hparams.verification.gradient_norm_ratio_max,
             # Weight verification
             weight_relative_error_max=hparams.verification.weight_relative_error_max,
             # Timer integrity
@@ -776,6 +774,9 @@ class Validator(BaseNode):
             fatal_error = False
             try:
                 for run_idx in range(runs_remaining):
+                    if run_idx > 0:
+                        await asyncio.sleep(60)
+
                     current_run = len(my_evals) + run_idx + 1
                     seed = f"{submission.miner_uid}:{current_run}:{int(time.time())}:{secrets.token_hex(16)}"
 
@@ -790,6 +791,29 @@ class Validator(BaseNode):
                         data_samples=hparams.benchmark_data_samples,
                         task_id=current_run,
                     )
+
+                    if (
+                        not result.success
+                        and (
+                            result.error_code == "EADDRINUSE"
+                            or (result.error and "EADDRINUSE" in result.error)
+                        )
+                        and self.affinetes_mode == "basilica"
+                    ):
+                        logger.warning(
+                            f"Run {current_run}: EADDRINUSE — recycling deployment and retrying once"
+                        )
+                        await self.affinetes_runner.delete_basilica_deployment()
+                        await asyncio.sleep(10)
+                        result = await self.affinetes_runner.evaluate(
+                            code=miner_code,
+                            seed=seed,
+                            steps=hparams.eval_steps,
+                            batch_size=hparams.benchmark_batch_size,
+                            sequence_length=hparams.benchmark_sequence_length,
+                            data_samples=hparams.benchmark_data_samples,
+                            task_id=current_run,
+                        )
 
                     if result.success:
                         logger.info(

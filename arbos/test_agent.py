@@ -74,7 +74,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     return InnerStepsResult(
@@ -112,7 +112,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     torch.backends.cudnn.benchmark = True
@@ -274,7 +274,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     return InnerStepsResult(
@@ -376,9 +376,33 @@ def test_tester_payload():
     check("payload has gpu_peak_tflops", payload["gpu_peak_tflops"] == 312.0)
     check("payload has max_loss_difference", payload["max_loss_difference"] == 0.3)
     check("payload has min_params_changed_ratio", payload["min_params_changed_ratio"] == 0.75)
-    check("payload has gradient_norm_ratio_max", payload["gradient_norm_ratio_max"] == 1.08)
     check("payload has weight_relative_error_max", payload["weight_relative_error_max"] == 0.008)
     check("payload has timer_divergence_threshold", payload["timer_divergence_threshold"] == 0.005)
+
+
+def test_local_tester_payload():
+    print("\n--- LocalDocker tester payload ---")
+    from tester import LocalDockerTester
+
+    h = load_hparams()
+    tester = LocalDockerTester(h, num_gpus=4, gpu_devices="4,5,6,7")
+    payload = tester._build_payload("# test code")
+
+    check("local payload model_url", payload["model_url"] == "Qwen/Qwen2.5-3B")
+    check("local payload num_gpus=4", payload["num_gpus"] == 4)
+    check("local payload has verification fields", payload["weight_relative_error_max"] == 0.008)
+
+    cmd = tester._docker_cmd("/tmp/code.py", "/tmp/params.json", "/tmp/runner.py")
+    check("docker cmd starts with docker", cmd[0] == "docker")
+    check("docker cmd has --gpus", "--gpus" in cmd)
+    check("docker cmd uses device flag", "device=4,5,6,7" in " ".join(cmd))
+    check("docker cmd has torchrun for multi-gpu", "torchrun" in cmd)
+    check("docker cmd has nproc_per_node=4", "4" in cmd[cmd.index("--nproc_per_node") + 1])
+
+    tester_single = LocalDockerTester(h, num_gpus=1)
+    cmd_single = tester_single._docker_cmd("/tmp/c.py", "/tmp/p.json", "/tmp/r.py")
+    check("single-gpu uses python3", "python3" in cmd_single)
+    check("single-gpu no torchrun", "torchrun" not in cmd_single)
 
 
 def test_env_loading():
@@ -423,7 +447,7 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 def get_strategy():
-    return "fsdp"
+    return {"dp_size": 2, "tp_size": 1}
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     return InnerStepsResult(
@@ -465,6 +489,10 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
                     mode = "miner"
                     max_steps = 2
                     dry_run = True
+                    local = False
+                    num_gpus = None
+                    gpu_devices = None
+                    docker_image = None
                     env_file = None
 
                 agent_mod.run_agent(FakeArgs())
@@ -507,6 +535,7 @@ if __name__ == "__main__":
     test_parse_response()
     test_llm_client_init()
     test_tester_payload()
+    test_local_tester_payload()
     test_env_loading()
     test_prompt_file()
     test_full_dryrun_with_mock()

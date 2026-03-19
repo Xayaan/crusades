@@ -13,7 +13,7 @@
 │   │   2. Decrypt timelock-encrypted code URLs                               │   │
 │   │   3. Download miner's train.py from URL                                 │   │
 │   │   4. Evaluate via Docker or Basilica (multiple runs)                    │   │
-│   │   5. Verify: loss, weights, gradients (single-GPU only)                 │   │
+│   │   5. Verify: loss and final weights against reference                    │   │
 │   │   6. Calculate MFU (Model FLOPs Utilization)                            │   │
 │   │   7. Update leaderboard with adaptive threshold                         │   │
 │   │   8. Set weights on blockchain (winner gets emissions)                  │   │
@@ -76,9 +76,7 @@ Each submission undergoes the following verification checks:
 | **Sequence Length** | Logits seq dim must match expected | `seq_len - 1` | Active |
 | **Token Count** | Must process the expected number of tokens | Exact match | Active |
 | **Loss Validity** | Loss must be positive, not NaN, close to reference | `max_loss_difference: 0.3` | Active |
-| **Gradient Relative Error** | `\|g - g_truth\| / \|g_truth\|` must be small | `gradient_norm_ratio_max: 1.08` (8%) | **Skipped** |
-| **Gradient Coverage** | All layers must have gradients | `100%` | **Skipped** |
-| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.01` | Active |
+| **Final Weight Verification** | Model weights after training must match reference | `weight_relative_error_max: 0.008` | Active |
 | **Trainable Params** | All params must be trainable | `100%` | Active |
 | **Params Changed** | Most param elements must change during training | `min: 70%` | Active |
 | **Timer Integrity** | Multiple timer sources must agree | `timer_divergence_threshold: 0.5%` | Active |
@@ -86,7 +84,7 @@ Each submission undergoes the following verification checks:
 | **Max Plausible MFU** | Ceiling cap -- no legitimate code exceeds this | `max_plausible_mfu: 75%` | Active |
 | **Success Rate** | Majority of runs must pass | `min_success_rate: 0.5` | Active |
 
-> **Multi-GPU note:** Gradient checks are skipped when `num_gpus > 1` because the miner creates their own optimizer (required for FSDP/TP/PP). Training correctness is still verified via loss comparison and final weight matching.
+> **Note:** Training correctness is verified via loss comparison and final weight matching against a uniform FSDP reference model.
 
 ### Multi-GPU Evaluation
 
@@ -98,19 +96,18 @@ When `docker.num_gpus > 1`, the evaluation runs in multi-GPU mode. This allows m
 |--------|---------------------------|--------------------------|
 | Launch command | `python eval_script.py` | `torchrun --nproc_per_node N eval_script.py` |
 | Docker network | `--network none` | Internal network (NCCL only, no egress) |
-| Data iterator | Sequential batches | Sharded (DDP/FSDP) or replicated (TP) based on `get_strategy()` |
-| Reference run | Rank 0 only | All ranks via DDP |
-| Optimizer | Validator-provided `GradientCapturingOptimizer` | `None` -- miner creates their own |
-| Gradient verification | Active | Skipped |
+| Data iterator | Sequential batches | Sharded or replicated based on `get_strategy()` topology |
+| Reference run | Single-GPU reference | All ranks via FSDP FULL_SHARD |
+| Optimizer | `None` -- miner creates their own | `None` -- miner creates their own |
 | Weight verification | Active | Active |
-| MFU calculation | Per-GPU | Per-GPU (same formula) |
+| MFU calculation | Per-GPU | Per-GPU × `dp_size` unique tokens |
 
 **Miner contract for multi-GPU:**
-- Must define `get_strategy()` returning `"ddp"`, `"fsdp"`, or `"tp"` (defaults to `"ddp"` if absent)
+- Must define `get_strategy()` returning `{"dp_size": N, "tp_size": M}` where `N * M == num_gpus` (legacy strings `"ddp"`, `"fsdp"`, `"tp"` also accepted)
 - `optimizer` will be `None` -- create your own after wrapping the model
 - Any parallelism strategy is allowed: DDP, FSDP, TP, PP, or combinations
 - `torch.distributed` process group is already initialized by `torchrun`
-- Must return `final_state` (full `state_dict` on CPU) in `InnerStepsResult` for weight verification (required for all strategies in multi-GPU mode)
+- Must return `final_state` (full `state_dict` on CPU) in `InnerStepsResult` for weight verification (required for all strategies, including single-GPU)
 - `device.index` gives the local rank (`os` module is forbidden)
 
 ### Adaptive Threshold & Leaderboard
@@ -229,8 +226,7 @@ Edit `hparams/hparams.json`:
     "verification": {
         "max_loss_difference": 0.3,
         "min_params_changed_ratio": 0.7,
-        "gradient_norm_ratio_max": 1.08,
-        "weight_relative_error_max": 0.01,
+        "weight_relative_error_max": 0.008,
         "timer_divergence_threshold": 0.005
     },
     
@@ -257,7 +253,7 @@ Edit `hparams/hparams.json`:
 | `docker.num_gpus` | Number of GPUs (multi-GPU via `torchrun`) | `2` |
 | `docker.memory_limit` | Container memory limit | `"80g"` |
 | `docker.shm_size` | Shared memory (auto-scaled for multi-GPU NCCL) | `"32g"` |
-| `gradient_norm_ratio_max` | Max gradient relative error (1 + %) | `1.08` (8%) |
+| `weight_relative_error_max` | Max relative error for final weight check | `0.008` (0.8%) |
 | `timer_divergence_threshold` | Max divergence between timer sources | `0.005` (0.5%) |
 | `min_mfu` | Floor MFU threshold — reject below this | `35.0` |
 | `max_plausible_mfu` | Ceiling MFU cap — no code exceeds this | `75.0` |

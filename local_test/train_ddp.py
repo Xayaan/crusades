@@ -4,11 +4,14 @@
 # DDP replicates the full model per GPU — memory is tight (~77GB peak).
 # micro_batch=1 keeps activations small enough to leave headroom.
 #
-# Requirements for verification:
-#   - get_strategy() -> "ddp"
-#   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
-#   - Must return final_state with full model state_dict for weight verification
+# Topology: dp_size=num_gpus, tp_size=1
 #   - Each rank processes different data (data-parallel)
+#   - Equivalent to: get_strategy() -> {"dp_size": num_gpus, "tp_size": 1}
+#
+# Requirements for verification:
+#   - get_strategy() returning "ddp" or {"dp_size": N, "tp_size": 1}
+#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
+#   - Must return final_state with full model state_dict for weight verification
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -23,11 +26,13 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
-    final_state: dict | None = None
+    final_state: dict | None
 
 
 def get_strategy():
-    return "ddp"
+    # Pure data-parallel: every GPU gets different data.
+    # Use "ddp" for any GPU count, or a dict for a fixed topology.
+    return {"dp_size": 2, "tp_size": 1}
 
 
 MICRO_BATCH_SIZE = 1

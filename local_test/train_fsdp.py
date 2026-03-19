@@ -1,12 +1,14 @@
 # Reference: FSDP (Fully Sharded Data Parallel) strategy
 #
-# Requirements for verification:
-#   - get_strategy() -> "fsdp"
-#   - Return InnerStepsResult with final_logits (3D), total_tokens, final_loss
-#   - Must return final_state: gathered full state dict (rank 0 only)
-#     FSDP flattens params so validator cannot read weights directly
+# Topology: dp_size=num_gpus, tp_size=1
 #   - Each rank processes different data (data-parallel)
+#   - Equivalent to: get_strategy() -> {"dp_size": num_gpus, "tp_size": 1}
 #
+# Requirements for verification:
+#   - get_strategy() returning "fsdp" or {"dp_size": N, "tp_size": 1}
+#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
+#   - Must return final_state: gathered full state dict for weight verification
+#     FSDP flattens params so validator cannot read weights directly
 
 import functools
 import warnings
@@ -30,11 +32,13 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
-    final_state: dict | None = None
+    final_state: dict | None
 
 
 def get_strategy():
-    return "fsdp"
+    # Pure data-parallel (sharded): every GPU gets different data.
+    # Use "fsdp" for any GPU count, or a dict for a fixed topology.
+    return {"dp_size": 2, "tp_size": 1}
 
 
 def _get_wrap_policy(model):
@@ -61,7 +65,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
 
-    if num_gpus > 1:
+    is_fsdp = num_gpus > 1
+    if is_fsdp:
         wrap_policy = _get_wrap_policy(model)
         mp_policy = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -83,7 +88,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             lr=1e-4,
             weight_decay=0.1,
             betas=(0.9, 0.95),
-            fused=num_gpus == 1,
+            fused=not is_fsdp,
         )
 
     total_tokens = 0
@@ -111,17 +116,18 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         final_logits = logits.detach()
         final_loss = loss.item()
 
-    # Must gather full state dict for weight verification (rank 0 only)
-    full_state = None
-    if num_gpus > 1:
+    # Gather full state dict for weight verification.
+    # FSDP requires the FULL_STATE_DICT context; single-GPU can read directly.
+    if is_fsdp:
         rank = dist.get_rank() if dist.is_initialized() else 0
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                 sd = model.state_dict()
-                if rank == 0:
-                    full_state = sd
+                full_state = sd if rank == 0 else None
+    else:
+        full_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     return InnerStepsResult(
         final_logits=final_logits,

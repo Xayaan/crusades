@@ -1,16 +1,20 @@
 """Arbos Agent — Crusades MFU Optimization Loop.
 
-Continuously improves train.py for maximum MFU using an LLM + Basilica testing.
+Continuously improves train.py for maximum MFU using an LLM + testing backend.
+Supports Basilica (cloud GPUs) or local Docker evaluation.
 Logs all attempts, saves improvements, and leaves submission to the human.
 
 Usage:
-    # Miner mode (default)
+    # Basilica cloud (default)
     python arbos/agent.py --train-py local_test/train_fsdp.py
 
-    # Validator mode (burn_uid 3, no submission fee)
-    python arbos/agent.py --train-py local_test/train_fsdp.py --mode validator
+    # Local Docker (no cloud costs, uses your own GPUs)
+    python arbos/agent.py --train-py local_test/train_fsdp.py --local
 
-    # Dry run (skip Basilica, test LLM generation only)
+    # Local Docker with specific GPUs
+    python arbos/agent.py --train-py local_test/train_fsdp.py --local --gpu-devices 4,5
+
+    # Dry run (skip evaluation, test LLM generation only)
     python arbos/agent.py --train-py local_test/train_fsdp.py --dry-run
 
     # Limit steps
@@ -317,19 +321,33 @@ def run_agent(args):
     hparams = load_hparams()
 
     from llm_client import LLMClient
-    from tester import BasilicaTester
+    from tester import BasilicaTester, LocalDockerTester
 
     llm = LLMClient()
-    tester = None if args.dry_run else BasilicaTester(hparams)
+    tester = None
+    if not args.dry_run:
+        if args.local:
+            tester = LocalDockerTester(
+                hparams,
+                project_root=PROJECT_ROOT,
+                image=args.docker_image,
+                num_gpus=args.num_gpus,
+                gpu_devices=args.gpu_devices,
+            )
+        else:
+            tester = BasilicaTester(hparams)
 
     state = AgentState.load()
     mode = args.mode
+
+    backend = "dry-run" if args.dry_run else ("local-docker" if args.local else "basilica")
 
     log.info("")
     log.info("=" * 60)
     log.info("  ARBOS — Crusades MFU Optimization Agent")
     log.info("=" * 60)
     log.info(f"  Mode:          {mode}")
+    log.info(f"  Backend:       {backend}")
     log.info(f"  LLM:           {llm.provider} ({llm.model})")
     log.info(f"  Initial file:  {initial_path}")
     log.info(f"  Dry run:       {args.dry_run}")
@@ -340,7 +358,7 @@ def run_agent(args):
 
     if not state.best_code_path or not Path(state.best_code_path).exists():
         if tester:
-            log.info("Testing initial submission on Basilica...")
+            log.info(f"Testing initial submission ({backend})...")
             result = tester.evaluate(initial_code)
             if result.success:
                 state.best_mfu = result.mfu
@@ -372,7 +390,7 @@ def run_agent(args):
                     )
                 )
         else:
-            log.info("[DRY RUN] Skipping initial Basilica test")
+            log.info("[DRY RUN] Skipping initial evaluation")
 
         path = save_best(initial_code, 0, state.best_mfu)
         state.best_code_path = str(path)
@@ -460,11 +478,11 @@ def run_agent(args):
                 state.save()
                 continue
 
-            log.info("Sending to Basilica for evaluation...")
+            log.info(f"Sending for evaluation ({backend})...")
             try:
                 result = tester.evaluate(response.code)
             except Exception as e:
-                log.error(f"Basilica error: {e}")
+                log.error(f"Evaluation error: {e}")
                 consecutive_failures += 1
                 state.add_attempt(
                     Attempt(
@@ -582,13 +600,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  # Start optimizing from reference FSDP implementation
+  # Start optimizing from reference FSDP implementation (Basilica cloud)
   python arbos/agent.py --train-py local_test/train_fsdp.py
+
+  # Use local Docker instead of Basilica (no cloud costs)
+  python arbos/agent.py --train-py local_test/train_fsdp.py --local
+
+  # Local Docker with specific GPUs
+  python arbos/agent.py --train-py local_test/train_fsdp.py --local --gpu-devices 4,5
+
+  # Local Docker with custom image and GPU count
+  python arbos/agent.py --train-py local_test/train_fsdp.py --local --num-gpus 4
 
   # Run as validator team (burn_uid 3)
   python arbos/agent.py --train-py local_test/train_fsdp.py --mode validator
 
-  # Test LLM code generation without Basilica (no GPU costs)
+  # Test LLM code generation without evaluation (no GPU costs)
   python arbos/agent.py --train-py local_test/train_fsdp.py --dry-run
 
   # Run 20 optimization steps then stop
@@ -607,6 +634,29 @@ Examples:
         help="Running mode: miner (pays fee) or validator (burn_uid, no fee)",
     )
     parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Use local Docker evaluation instead of Basilica cloud",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs for local Docker (default: docker.num_gpus from hparams)",
+    )
+    parser.add_argument(
+        "--gpu-devices",
+        type=str,
+        default=None,
+        help="Specific GPU device IDs for local Docker, e.g. '4,5' or '0,1,2,3'",
+    )
+    parser.add_argument(
+        "--docker-image",
+        type=str,
+        default=None,
+        help="Docker image for local evaluation (default: from hparams or templar-eval:latest)",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
@@ -615,7 +665,7 @@ Examples:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Skip Basilica evaluation (test LLM generation only)",
+        help="Skip evaluation (test LLM generation only)",
     )
     parser.add_argument(
         "--env-file",
@@ -624,6 +674,19 @@ Examples:
         help="Path to .env file (default: arbos/.env)",
     )
     args = parser.parse_args()
+
+    local_only_flags = []
+    if args.num_gpus is not None:
+        local_only_flags.append("--num-gpus")
+    if args.gpu_devices is not None:
+        local_only_flags.append("--gpu-devices")
+    if args.docker_image is not None:
+        local_only_flags.append("--docker-image")
+    if local_only_flags and not args.local:
+        parser.error(
+            f"{', '.join(local_only_flags)} require --local (otherwise Basilica is used "
+            f"and these flags are ignored)"
+        )
 
     run_agent(args)
 
