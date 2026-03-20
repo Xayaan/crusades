@@ -8,9 +8,10 @@ same Docker container.
 
    docker build --network=host --no-cache -f environments/templar/Dockerfile -t templar-eval:latest .
 
-2. Run the simulation (requires 2x A100 GPUs for 7B model):
+2. Run the simulation (requires 4x A100 GPUs for 7B model):
 
-    docker run --gpus 2 -it --rm \
+    # Using GPUs 4,5,6,7 (adjust --gpus flag for your device IDs):
+    docker run --gpus '"device=4,5,6,7"' -it --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
         -e NCCL_P2P_LEVEL=NVL \
@@ -18,7 +19,7 @@ same Docker container.
         -e NCCL_NVLS_ENABLE=1 \
         -e NCCL_IB_DISABLE=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        -v "$(pwd)/local_test/train_ddp.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/train_mixed.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
@@ -27,8 +28,29 @@ same Docker container.
         templar-eval:latest \
         python3 /test/simulate.py
 
-   Replace train_ddp.py with train_fsdp.py, train_tp.py, or train_mixed.py to test
-   other strategies. train_mixed.py requires 4 GPUs (dp_size=2, tp_size=2).
+    # Using all GPUs (if only 4 available):
+    docker run --gpus 4 -it --rm \
+        --ipc=host \
+        --ulimit memlock=-1:-1 \
+        -e NCCL_P2P_LEVEL=NVL \
+        -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
+        -e NCCL_NVLS_ENABLE=1 \
+        -e NCCL_IB_DISABLE=1 \
+        -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        -v "$(pwd)/local_test/train_mixed.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
+        -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
+        -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
+        -v "$(pwd)/src/crusades/core/security_defs.py":/app/crusades/core/security_defs.py:ro \
+        -e PYTHONPATH=/app \
+        templar-eval:latest \
+        python3 /test/simulate.py
+
+   Strategies for 4 GPUs:
+   - train_mixed.py: dp_size=2, tp_size=2 (mixed DP+TP)
+   - train_ddp.py:   dp_size=4, tp_size=1 (4-way DDP) — update get_strategy()
+   - train_fsdp.py:  dp_size=4, tp_size=1 (4-way FSDP) — update get_strategy()
+   - train_tp.py:    dp_size=1, tp_size=4 (4-way TP) — update get_strategy()
 """
 
 import asyncio

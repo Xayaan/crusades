@@ -38,7 +38,7 @@ class InnerStepsResult:
 def get_strategy():
     # Pure data-parallel (sharded): every GPU gets different data.
     # Use "fsdp" for any GPU count, or a dict for a fixed topology.
-    return {"dp_size": 2, "tp_size": 1}
+    return {"dp_size": 4, "tp_size": 1}
 
 
 def _get_wrap_policy(model):

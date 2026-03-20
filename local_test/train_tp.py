@@ -33,7 +33,7 @@ class InnerStepsResult:
 def get_strategy():
     # Pure tensor-parallel: all GPUs get the same data.
     # Use "tp" for any GPU count, or a dict for a fixed topology.
-    return {"dp_size": 1, "tp_size": 2}
+    return {"dp_size": 1, "tp_size": 4}
 
 
 def _apply_tp(model, device_mesh):

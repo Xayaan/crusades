@@ -1352,7 +1352,7 @@ def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     )
 
 
-_REFERENCE_MICRO_BATCH_SIZE = 8
+_REFERENCE_MICRO_BATCH_SIZE = 4
 
 
 def _run_reference(

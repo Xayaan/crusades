@@ -8,13 +8,13 @@
     "eval_timeout": 3600,
     "min_success_rate": 0.5,
 
-    "benchmark_model_name": "Qwen/Qwen2.5-3B",
+    "benchmark_model_name": "Qwen/Qwen2.5-7B",
     "benchmark_dataset_name": "HuggingFaceFW/fineweb",
     "benchmark_dataset_split": "train",
     "benchmark_data_samples": 10000,
     "benchmark_master_seed": 42,
     "benchmark_sequence_length": 1024,
-    "benchmark_batch_size": 32,
+    "benchmark_batch_size": 16,
 
     "set_weights_interval_blocks": 100,
     "reveal_blocks": 20,
@@ -22,20 +22,20 @@
     "block_time": 12,
 
     "docker": {
-        "num_gpus": 2,
-        "memory_limit": "160g",
-        "shm_size": "32g"
+        "num_gpus": 4,
+        "memory_limit": "320g",
+        "shm_size": "64g"
     },
 
     "basilica": {
         "image": "ghcr.io/one-covenant/templar-eval:latest",
         "ttl_seconds": 7200,
-        "gpu_count": 2,
+        "gpu_count": 4,
         "gpu_models": ["A100"],
         "min_gpu_memory_gb": 80,
         "interconnect": "SXM",
-        "cpu": "8",
-        "memory": "160Gi"
+        "cpu": "16",
+        "memory": "320Gi"
     },
 
     "verification": {
