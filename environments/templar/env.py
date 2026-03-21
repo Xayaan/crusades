@@ -1895,7 +1895,7 @@ class Actor:
             if _multi_gpu:
                 if not dist.is_initialized():
                     torch.cuda.set_device(_LOCAL_RANK)
-                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=600))
+                    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=3600))
                     logger.info(f"Initialized process group: rank {_LOCAL_RANK}/{_WORLD_SIZE}")
 
             seq_len = sequence_length or EVAL_SEQUENCE_LENGTH

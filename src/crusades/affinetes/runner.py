@@ -760,17 +760,39 @@ asyncio.run(main())
                 logger.info(f"   Deployment ID: {deployment.id}")
             logger.info("-" * 60)
 
+            # DNS resolution check
+            import socket
+            from urllib.parse import urlparse
+
+            parsed = urlparse(deployment.url)
+            hostname = parsed.hostname
+            logger.info(f"[BASILICA] DNS resolution test for {hostname}...")
+            try:
+                addrs = socket.getaddrinfo(hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                ips = list({a[4][0] for a in addrs})
+                logger.info(f"   DNS resolved to: {ips}")
+            except socket.gaierror as dns_err:
+                logger.error(f"   DNS resolution FAILED: {dns_err}")
+                logger.error("   This is a DNS issue — check /etc/resolv.conf")
+
             # Check health endpoint first
             logger.info("[BASILICA] Checking health endpoint...")
+            health_start = time.time()
             async with httpx.AsyncClient(timeout=30) as client:
                 try:
                     health_response = await client.get(f"{deployment.url}/health")
+                    health_elapsed = time.time() - health_start
                     if health_response.status_code == 200:
-                        logger.info("[BASILICA] Health check: OK")
+                        logger.info(f"[BASILICA] Health check: OK ({health_elapsed:.2f}s)")
                     else:
-                        logger.warning(f"[BASILICA] Health check: {health_response.status_code}")
+                        logger.warning(
+                            f"[BASILICA] Health check: {health_response.status_code} ({health_elapsed:.2f}s)"
+                        )
                 except Exception as e:
-                    logger.warning(f"[BASILICA] Health check failed: {e}")
+                    health_elapsed = time.time() - health_start
+                    logger.warning(
+                        f"[BASILICA] Health check failed after {health_elapsed:.2f}s: {e}"
+                    )
 
             # Call the /evaluate endpoint
             payload = {
@@ -803,14 +825,24 @@ asyncio.run(main())
             logger.info("[BASILICA] Sending evaluation request...")
             logger.info(f"   POST {deployment.url}/evaluate")
             logger.info(f"   Timeout: {http_timeout}s")
+            logger.info(f"   Payload size: {len(str(payload))} chars")
 
             start_time = time.time()
 
+            async def _post_with_progress(client, url, payload):
+                """POST with periodic progress logging."""
+                post_task = asyncio.create_task(client.post(url, json=payload))
+                while not post_task.done():
+                    await asyncio.sleep(60)
+                    if not post_task.done():
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"   [WAITING] Evaluation in progress... {elapsed:.0f}s elapsed"
+                        )
+                return await post_task
+
             async with httpx.AsyncClient(timeout=http_timeout) as client:
-                response = await client.post(
-                    f"{deployment.url}/evaluate",
-                    json=payload,
-                )
+                response = await _post_with_progress(client, f"{deployment.url}/evaluate", payload)
 
                 elapsed = time.time() - start_time
                 logger.info(f"[BASILICA] Response received in {elapsed:.1f}s")
@@ -874,17 +906,39 @@ asyncio.run(main())
 
                 return result
 
-        except (TimeoutError, httpx.TimeoutException):
-            logger.error(f"[BASILICA] Timeout after {self.timeout}s!")
+        except (TimeoutError, httpx.TimeoutException) as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[BASILICA] Timeout after {elapsed:.0f}s (limit: {http_timeout}s)!")
+            logger.error(f"   Exception type: {type(e).__name__}: {e}")
             return EvaluationResult.failure(
-                f"Basilica timeout after {self.timeout}s",
+                f"Basilica timeout after {elapsed:.0f}s",
+                task_id=task_id,
+            )
+        except httpx.ConnectError as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[BASILICA] Connection error after {elapsed:.0f}s!")
+            logger.error(f"   {type(e).__name__}: {e}")
+            logger.error("   This may be a DNS resolution or network issue.")
+            return EvaluationResult.failure(
+                f"Basilica connection error: {e}",
+                task_id=task_id,
+            )
+        except httpx.RemoteProtocolError as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[BASILICA] Remote protocol error after {elapsed:.0f}s!")
+            logger.error(f"   {type(e).__name__}: {e}")
+            logger.error("   The remote server closed the connection unexpectedly.")
+            return EvaluationResult.failure(
+                f"Basilica remote protocol error after {elapsed:.0f}s: {e}",
                 task_id=task_id,
             )
         except Exception as e:
-            logger.error(f"[BASILICA] Error: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"[BASILICA] Error after {elapsed:.0f}s: {e}")
+            logger.error(f"   Exception type: {type(e).__name__}")
             logger.error(traceback.format_exc())
             return EvaluationResult.failure(
-                f"Basilica error: {e}",
+                f"Basilica error after {elapsed:.0f}s: {e}",
                 task_id=task_id,
             )
 
@@ -960,7 +1014,48 @@ asyncio.run(main())
             deployment = await client.get_async(response.instance_name)
             logger.info(f"   Basilica ID: {deployment.name}")
 
-            await deployment.wait_until_ready_async(timeout=self.timeout)
+            deploy_timeout = min(self.timeout, 2700)
+            poll_interval = 10
+            elapsed = 0
+            while elapsed < deploy_timeout:
+                status = await deployment.status_async()
+                phase = getattr(status, "phase", None)
+                ready_count = status.replicas_ready
+                desired_count = status.replicas_desired
+
+                if status.is_ready:
+                    logger.info(
+                        f"   Status: ready (replicas: {ready_count}/{desired_count}), "
+                        "verifying HTTP health..."
+                    )
+                    try:
+                        async with httpx.AsyncClient(timeout=15) as hc:
+                            resp = await hc.get(f"{deployment.url}/health")
+                            if resp.status_code == 200:
+                                logger.info("   HTTP health check passed!")
+                                break
+                            logger.warning(
+                                f"   Health check returned {resp.status_code}, retrying..."
+                            )
+                    except Exception as health_err:
+                        logger.warning(f"   Health check failed: {health_err}, retrying...")
+                elif status.is_failed:
+                    raise RuntimeError(f"Deployment failed: {status.message}")
+                else:
+                    if elapsed % 30 == 0 or elapsed == 0:
+                        logger.info(
+                            f"   Waiting... phase={phase} replicas={ready_count}/{desired_count} "
+                            f"({elapsed}s elapsed)"
+                        )
+
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+            else:
+                raise TimeoutError(
+                    f"Deployment not ready after {deploy_timeout}s "
+                    f"(phase={phase}, replicas={ready_count}/{desired_count})"
+                )
+
             await deployment.refresh_async()
 
             deploy_time = time.time() - deploy_start
