@@ -36,11 +36,13 @@ from crusades.core.exceptions import EvaluationErrorCode
 
 # Optional: Basilica SDK for cloud GPU evaluation
 try:
-    from basilica import BasilicaClient
+    from basilica import BasilicaClient, DeploymentFailed, DeploymentTimeout
 
     BASILICA_AVAILABLE = True
 except ImportError:
     BasilicaClient = None
+    DeploymentFailed = None
+    DeploymentTimeout = None
     BASILICA_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -710,17 +712,15 @@ asyncio.run(main())
     ) -> EvaluationResult:
         """Run evaluation remotely via Basilica SDK.
 
-        Uses BasilicaClient to deploy a custom Docker image and call
-        the /evaluate endpoint for MFU evaluation. Each call creates
-        a fresh deployment and deletes it when done, ensuring clean
-        GPU state between runs.
+        Uses BasilicaClient.deploy_async to provision a GPU container and call
+        the /evaluate endpoint for MFU evaluation. Each call creates a fresh
+        deployment and deletes it when done, ensuring clean GPU state.
 
         Flow:
-        1. Create fresh Basilica deployment
-        2. Wait for deployment to be ready (/health endpoint)
-        3. POST to /evaluate with miner's code
+        1. deploy_async: create deployment, wait until DNS + HTTP ready
+        2. POST /evaluate → get job_id back (instant, no proxy timeout)
+        3. Poll GET /eval-status/{job_id} every 30s until done
         4. Delete deployment (in finally block)
-        5. Return MFU results
         """
         logger.info("=" * 60)
         logger.info("[BASILICA] Starting remote GPU evaluation")
@@ -743,66 +743,56 @@ asyncio.run(main())
         deployment = None
         log_stream_task = None
         start_time = time.time()
-        http_timeout = self.timeout + 120
+        http_timeout = max(self.timeout + 600, 1800)
+        deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
         try:
-            # Fresh deployment per evaluation run — ensures clean GPU state
             logger.info("[BASILICA] Creating fresh deployment for this run...")
-            deployment = await self._create_basilica_deployment()
+            logger.info(f"   Image: {self.basilica_image}")
+            logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
+            logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
+            if self.basilica_interconnect:
+                logger.info(f"   Interconnect: {self.basilica_interconnect}")
+            logger.info(f"   CPU: {self.basilica_cpu}, Memory: {self.basilica_memory}")
+            logger.info(
+                f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds / 60:.0f} min)"
+            )
+            logger.info(f"   Deployment name: {deploy_name}")
 
-            if deployment is None:
-                logger.error("[BASILICA] Failed to create deployment!")
-                return EvaluationResult.failure(
-                    "Failed to create Basilica deployment",
-                    task_id=task_id,
-                )
+            client = BasilicaClient()
+            deploy_kwargs = {
+                "name": deploy_name,
+                "image": self.basilica_image,
+                "port": 8000,
+                "ttl_seconds": self.basilica_ttl_seconds,
+                "gpu_count": self.basilica_gpu_count,
+                "gpu_models": self.basilica_gpu_models,
+                "min_gpu_memory_gb": self.basilica_min_gpu_memory_gb,
+                "cpu": self.basilica_cpu,
+                "memory": self.basilica_memory,
+                "timeout": 1800,
+            }
+            if self.basilica_interconnect:
+                deploy_kwargs["interconnect"] = self.basilica_interconnect
+            if self.basilica_geo:
+                deploy_kwargs["geo"] = self.basilica_geo
+            if self.basilica_spot:
+                deploy_kwargs["spot"] = self.basilica_spot
 
-            logger.info("-" * 60)
-            logger.info("[BASILICA] Deployment ready!")
-            logger.info(f"   URL: {deployment.url}")
+            deploy_start = time.time()
+            deployment = await client.deploy_async(**deploy_kwargs)
+            deploy_time = time.time() - deploy_start
+
             dep_name = getattr(deployment, "name", None) or getattr(deployment, "id", "unknown")
+            logger.info(f"[BASILICA] Deployment ready in {deploy_time:.1f}s")
+            logger.info(f"   URL: {deployment.url}")
             logger.info(f"   Deployment ID: {dep_name}")
-            logger.info("-" * 60)
+            logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
 
             log_dir = Path("logs/basilica")
             log_file = log_dir / f"{dep_name}_{int(time.time())}.log"
             log_stream_task = asyncio.create_task(self._stream_basilica_logs(deployment, log_file))
             logger.info(f"[BASILICA] Log streaming started → {log_file}")
 
-            # DNS resolution check
-            import socket
-            from urllib.parse import urlparse
-
-            parsed = urlparse(deployment.url)
-            hostname = parsed.hostname
-            logger.info(f"[BASILICA] DNS resolution test for {hostname}...")
-            try:
-                addrs = socket.getaddrinfo(hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
-                ips = list({a[4][0] for a in addrs})
-                logger.info(f"   DNS resolved to: {ips}")
-            except socket.gaierror as dns_err:
-                logger.error(f"   DNS resolution FAILED: {dns_err}")
-                logger.error("   This is a DNS issue — check /etc/resolv.conf")
-
-            # Check health endpoint first
-            logger.info("[BASILICA] Checking health endpoint...")
-            health_start = time.time()
-            async with httpx.AsyncClient(timeout=30) as client:
-                try:
-                    health_response = await client.get(f"{deployment.url}/health")
-                    health_elapsed = time.time() - health_start
-                    if health_response.status_code == 200:
-                        logger.info(f"[BASILICA] Health check: OK ({health_elapsed:.2f}s)")
-                    else:
-                        logger.warning(
-                            f"[BASILICA] Health check: {health_response.status_code} ({health_elapsed:.2f}s)"
-                        )
-                except Exception as e:
-                    health_elapsed = time.time() - health_start
-                    logger.warning(
-                        f"[BASILICA] Health check failed after {health_elapsed:.2f}s: {e}"
-                    )
-
-            # Call the /evaluate endpoint
             payload = {
                 "task_id": task_id,
                 "seed": seed,
@@ -818,101 +808,195 @@ asyncio.run(main())
                 "use_random_init": True,
                 "min_trainable_params_ratio": 1.0,
                 "min_params_changed_ratio": self.min_params_changed_ratio,
-                # Weight verification
                 "weight_relative_error_max": self.weight_relative_error_max,
-                # Timer integrity
                 "timer_divergence_threshold": self.timer_divergence_threshold,
-                # MFU calculation
                 "gpu_peak_tflops": self.gpu_peak_tflops,
                 "max_plausible_mfu": self.max_plausible_mfu,
                 "min_mfu": self.min_mfu,
                 "num_gpus": self.basilica_gpu_count,
             }
 
-            logger.info("[BASILICA] Sending evaluation request...")
+            logger.info("[BASILICA] Sending evaluation request (async)...")
             logger.info(f"   POST {deployment.url}/evaluate")
-            logger.info(f"   Timeout: {http_timeout}s")
+            logger.info(f"   Timeout budget: {http_timeout}s")
             logger.info(f"   Payload size: {len(str(payload))} chars")
 
-            start_time = time.time()
+            post_start = time.time()
 
-            async def _post_with_progress(client, url, payload):
-                """POST with periodic progress logging."""
-                post_task = asyncio.create_task(client.post(url, json=payload))
-                while not post_task.done():
-                    await asyncio.sleep(60)
-                    if not post_task.done():
-                        elapsed = time.time() - start_time
-                        logger.info(
-                            f"   [WAITING] Evaluation in progress... {elapsed:.0f}s elapsed"
+            # ── Step 1: Submit job (returns 202 + job_id immediately) ──
+            async with httpx.AsyncClient(timeout=60) as submit_client:
+                submit_resp = await submit_client.post(f"{deployment.url}/evaluate", json=payload)
+
+            if submit_resp.status_code not in (200, 202):
+                error_text = submit_resp.text[:500]
+                logger.error(f"[BASILICA] Job submission failed: {submit_resp.status_code}")
+                logger.error(f"   Error: {error_text}")
+                return EvaluationResult.failure(
+                    f"Basilica /evaluate submission error: {submit_resp.status_code} - {error_text}",
+                    task_id=task_id,
+                )
+
+            submit_data = submit_resp.json()
+            job_id = submit_data.get("job_id")
+            if not job_id:
+                return EvaluationResult.failure(
+                    f"Basilica /evaluate did not return job_id: {submit_data}",
+                    task_id=task_id,
+                )
+
+            logger.info(f"[BASILICA] Job accepted: {job_id}")
+
+            # ── Step 2: Poll /eval-status/{job_id} until done ──
+            poll_url = f"{deployment.url}/eval-status/{job_id}"
+            poll_interval = 30
+            max_consecutive_errors = 10
+            consecutive_errors = 0
+
+            while True:
+                elapsed = time.time() - post_start
+                if elapsed >= http_timeout:
+                    logger.error(
+                        f"[BASILICA] Polling timeout after {elapsed:.0f}s (budget: {http_timeout}s)"
+                    )
+                    return EvaluationResult.failure(
+                        f"Basilica evaluation timed out after {elapsed:.0f}s (polling)",
+                        task_id=task_id,
+                    )
+
+                await asyncio.sleep(poll_interval)
+                elapsed = time.time() - post_start
+
+                try:
+                    async with httpx.AsyncClient(timeout=30) as poll_client:
+                        poll_resp = await poll_client.get(poll_url)
+
+                    consecutive_errors = 0
+
+                    if poll_resp.status_code == 404:
+                        logger.warning(
+                            f"[BASILICA] Job {job_id} not found (404) — "
+                            f"container may have restarted"
                         )
-                return await post_task
+                        return EvaluationResult.failure(
+                            f"Basilica job {job_id} lost (404 on poll)",
+                            task_id=task_id,
+                        )
 
-            async with httpx.AsyncClient(timeout=http_timeout) as client:
-                response = await _post_with_progress(client, f"{deployment.url}/evaluate", payload)
+                    if poll_resp.status_code != 200:
+                        logger.warning(
+                            f"[BASILICA] Poll got {poll_resp.status_code}, "
+                            f"will retry in {poll_interval}s ({elapsed:.0f}s elapsed)"
+                        )
+                        continue
 
-                elapsed = time.time() - start_time
-                logger.info(f"[BASILICA] Response received in {elapsed:.1f}s")
-                logger.info(f"   Status code: {response.status_code}")
+                    poll_data = poll_resp.json()
+                    status = poll_data.get("status")
 
-                if response.status_code != 200:
-                    error_text = response.text[:500]
-                    logger.error("[BASILICA] Evaluation failed!")
-                    logger.error(f"   Error: {error_text}")
-                    return EvaluationResult.failure(
-                        f"Basilica /evaluate error: {response.status_code} - {error_text}",
-                        task_id=task_id,
-                    )
+                    if status == "pending":
+                        logger.info(
+                            f"   [POLLING] Evaluation in progress... {elapsed:.0f}s elapsed"
+                        )
+                        continue
 
-                result_data = response.json()
-                if not isinstance(result_data, dict):
-                    return EvaluationResult.failure(
-                        f"Basilica returned non-object response: {type(result_data).__name__}",
-                        task_id=task_id,
-                    )
-
-                # Strict response integrity checks
-                returned_seed = str(result_data.get("seed", ""))
-                if returned_seed and returned_seed != seed:
-                    return EvaluationResult.failure(
-                        f"Basilica response seed mismatch: expected {seed}, got {returned_seed}",
-                        task_id=task_id,
-                    )
-
-                returned_task_id = result_data.get("task_id")
-                if returned_task_id is not None and int(returned_task_id) != int(task_id):
-                    return EvaluationResult.failure(
-                        f"Basilica response task_id mismatch: expected {task_id}, got {returned_task_id}",
-                        task_id=task_id,
-                    )
-
-                for numeric_field in ("mfu", "tps", "wall_time_seconds"):
-                    if numeric_field in result_data:
-                        value = float(result_data[numeric_field])
-                        if not math.isfinite(value):
+                    if status in ("done", "failed"):
+                        result_data = poll_data.get("result")
+                        if result_data is None:
                             return EvaluationResult.failure(
-                                f"Basilica response has non-finite {numeric_field}",
+                                f"Basilica job {job_id} status={status} but no result",
                                 task_id=task_id,
                             )
+                        logger.info(
+                            f"[BASILICA] Job {job_id} completed with status={status} "
+                            f"in {elapsed:.1f}s"
+                        )
+                        break
 
-                result = EvaluationResult.from_dict(result_data)
-                result.code = code
+                    logger.warning(
+                        f"[BASILICA] Unknown poll status: {status}, will retry in {poll_interval}s"
+                    )
 
-                logger.info("=" * 60)
-                logger.info("[BASILICA] Evaluation complete!")
-                logger.info(f"   Success: {result.success}")
-                logger.info(f"   MFU: {result.mfu:.2f}%")
-                logger.info(f"   TPS: {result.tps:,.2f} tokens/second")
-                logger.info(f"   Total tokens: {result.total_tokens:,}")
-                logger.info(f"   Wall time: {result.wall_time_seconds:.2f}s")
-                if result.diagnostics:
-                    logger.info(f"   Diagnostics: {result.diagnostics}")
-                if result.error:
-                    logger.error(f"   Error: {result.error}")
-                logger.info("=" * 60)
+                except (
+                    httpx.TimeoutException,
+                    httpx.ConnectError,
+                    httpx.RemoteProtocolError,
+                ) as poll_err:
+                    consecutive_errors += 1
+                    logger.warning(
+                        f"[BASILICA] Poll error ({consecutive_errors}/{max_consecutive_errors}): "
+                        f"{type(poll_err).__name__}: {poll_err}"
+                    )
+                    if consecutive_errors >= max_consecutive_errors:
+                        return EvaluationResult.failure(
+                            f"Basilica polling failed {max_consecutive_errors} times: {poll_err}",
+                            task_id=task_id,
+                        )
+                    continue
 
-                return result
+            elapsed = time.time() - post_start
+            logger.info(f"[BASILICA] Evaluation result received in {elapsed:.1f}s")
+            if not isinstance(result_data, dict):
+                return EvaluationResult.failure(
+                    f"Basilica returned non-object response: {type(result_data).__name__}",
+                    task_id=task_id,
+                )
 
+            returned_seed = str(result_data.get("seed", ""))
+            if returned_seed and returned_seed != seed:
+                return EvaluationResult.failure(
+                    f"Basilica response seed mismatch: expected {seed}, got {returned_seed}",
+                    task_id=task_id,
+                )
+
+            returned_task_id = result_data.get("task_id")
+            if returned_task_id is not None and int(returned_task_id) != int(task_id):
+                return EvaluationResult.failure(
+                    f"Basilica response task_id mismatch: expected {task_id}, got {returned_task_id}",
+                    task_id=task_id,
+                )
+
+            for numeric_field in ("mfu", "tps", "wall_time_seconds"):
+                if numeric_field in result_data:
+                    value = float(result_data[numeric_field])
+                    if not math.isfinite(value):
+                        return EvaluationResult.failure(
+                            f"Basilica response has non-finite {numeric_field}",
+                            task_id=task_id,
+                        )
+
+            result = EvaluationResult.from_dict(result_data)
+            result.code = code
+
+            logger.info("=" * 60)
+            logger.info("[BASILICA] Evaluation complete!")
+            logger.info(f"   Success: {result.success}")
+            logger.info(f"   MFU: {result.mfu:.2f}%")
+            logger.info(f"   TPS: {result.tps:,.2f} tokens/second")
+            logger.info(f"   Total tokens: {result.total_tokens:,}")
+            logger.info(f"   Wall time: {result.wall_time_seconds:.2f}s")
+            if result.diagnostics:
+                logger.info(f"   Diagnostics: {result.diagnostics}")
+            if result.error:
+                logger.error(f"   Error: {result.error}")
+            logger.info("=" * 60)
+
+            return result
+
+        except DeploymentTimeout as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[BASILICA] Deployment timed out after {elapsed:.0f}s!")
+            logger.error(f"   {e}")
+            return EvaluationResult.failure(
+                f"Basilica deployment timeout after {elapsed:.0f}s: {e}",
+                task_id=task_id,
+            )
+        except DeploymentFailed as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[BASILICA] Deployment failed after {elapsed:.0f}s!")
+            logger.error(f"   {e}")
+            return EvaluationResult.failure(
+                f"Basilica deployment failed: {e}",
+                task_id=task_id,
+            )
         except (TimeoutError, httpx.TimeoutException) as e:
             elapsed = time.time() - start_time
             logger.error(f"[BASILICA] Timeout after {elapsed:.0f}s (limit: {http_timeout}s)!")
@@ -925,7 +1009,6 @@ asyncio.run(main())
             elapsed = time.time() - start_time
             logger.error(f"[BASILICA] Connection error after {elapsed:.0f}s!")
             logger.error(f"   {type(e).__name__}: {e}")
-            logger.error("   This may be a DNS resolution or network issue.")
             return EvaluationResult.failure(
                 f"Basilica connection error: {e}",
                 task_id=task_id,
@@ -934,7 +1017,6 @@ asyncio.run(main())
             elapsed = time.time() - start_time
             logger.error(f"[BASILICA] Remote protocol error after {elapsed:.0f}s!")
             logger.error(f"   {type(e).__name__}: {e}")
-            logger.error("   The remote server closed the connection unexpectedly.")
             return EvaluationResult.failure(
                 f"Basilica remote protocol error after {elapsed:.0f}s: {e}",
                 task_id=task_id,
@@ -1017,127 +1099,6 @@ asyncio.run(main())
             with open(log_path, "a") as f:
                 f.write(f"\n# Ended: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
             logger.info(f"[BASILICA-LOGS] Saved to {log_path}")
-
-    async def _create_basilica_deployment(self):
-        """Create a fresh Basilica deployment for a single evaluation run.
-
-        Each evaluation gets its own deployment to ensure clean GPU state
-        and avoid inter-run contamination (NCCL leaks, CUDA state, etc.).
-        Returns the deployment object or None on failure.
-        """
-        logger.info("[BASILICA] Creating NEW deployment")
-        logger.info(f"   Image: {self.basilica_image}")
-        logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
-        logger.info(f"   Min GPU memory: {self.basilica_min_gpu_memory_gb}GB")
-        if self.basilica_interconnect:
-            logger.info(f"   Interconnect: {self.basilica_interconnect}")
-        logger.info(f"   CPU: {self.basilica_cpu}, Memory: {self.basilica_memory}")
-        if self.basilica_geo:
-            logger.info(f"   Geo: {self.basilica_geo}")
-        if self.basilica_spot:
-            logger.info("   Spot: enabled")
-        logger.info(
-            f"   TTL: {self.basilica_ttl_seconds}s ({self.basilica_ttl_seconds / 60:.0f} min)"
-        )
-        logger.info("[BASILICA] Requesting GPU from Basilica... (this may take 2-5 minutes)")
-
-        deploy_name = f"templar-eval-{uuid.uuid4().hex[:8]}"
-        logger.info(f"   Deployment name: {deploy_name}")
-
-        deployment = None
-        try:
-            deploy_start = time.time()
-            client = BasilicaClient()
-
-            # Split into create + get + wait (instead of client.deploy()) so
-            # we always hold a Deployment reference for cleanup on failure.
-            # All calls use async variants to avoid blocking the event loop.
-            deploy_kwargs = {
-                "instance_name": deploy_name,
-                "image": self.basilica_image,
-                "port": 8000,
-                "ttl_seconds": self.basilica_ttl_seconds,
-                "gpu_count": self.basilica_gpu_count,
-                "gpu_models": self.basilica_gpu_models,
-                "min_gpu_memory_gb": self.basilica_min_gpu_memory_gb,
-                "cpu": self.basilica_cpu,
-                "memory": self.basilica_memory,
-            }
-            if self.basilica_interconnect:
-                deploy_kwargs["interconnect"] = self.basilica_interconnect
-            if self.basilica_geo:
-                deploy_kwargs["geo"] = self.basilica_geo
-            if self.basilica_spot:
-                deploy_kwargs["spot"] = self.basilica_spot
-            response = await client.create_deployment_async(**deploy_kwargs)
-            deployment = await client.get_async(response.instance_name)
-            logger.info(f"   Basilica ID: {deployment.name}")
-
-            deploy_timeout = min(self.timeout, 2700)
-            poll_interval = 10
-            elapsed = 0
-            while elapsed < deploy_timeout:
-                status = await deployment.status_async()
-                phase = getattr(status, "phase", None)
-                ready_count = status.replicas_ready
-                desired_count = status.replicas_desired
-
-                if status.is_ready:
-                    logger.info(
-                        f"   Status: ready (replicas: {ready_count}/{desired_count}), "
-                        "verifying HTTP health..."
-                    )
-                    try:
-                        async with httpx.AsyncClient(timeout=15) as hc:
-                            resp = await hc.get(f"{deployment.url}/health")
-                            if resp.status_code == 200:
-                                logger.info("   HTTP health check passed!")
-                                break
-                            logger.warning(
-                                f"   Health check returned {resp.status_code}, retrying..."
-                            )
-                    except Exception as health_err:
-                        logger.warning(f"   Health check failed: {health_err}, retrying...")
-                elif status.is_failed:
-                    raise RuntimeError(f"Deployment failed: {status.message}")
-                else:
-                    if elapsed % 30 == 0 or elapsed == 0:
-                        logger.info(
-                            f"   Waiting... phase={phase} replicas={ready_count}/{desired_count} "
-                            f"({elapsed}s elapsed)"
-                        )
-
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-            else:
-                raise TimeoutError(
-                    f"Deployment not ready after {deploy_timeout}s "
-                    f"(phase={phase}, replicas={ready_count}/{desired_count})"
-                )
-
-            await deployment.refresh_async()
-
-            deploy_time = time.time() - deploy_start
-            logger.info(f"[BASILICA] Deployment ready in {deploy_time:.1f}s")
-            logger.info(f"   Deployment URL: {deployment.url}")
-            logger.info(f"   GPU: {self.basilica_gpu_count}x {self.basilica_gpu_models}")
-            logger.info(
-                f"   TTL: {self.basilica_ttl_seconds}s (expires in {self.basilica_ttl_seconds / 60:.0f} min)"
-            )
-
-            return deployment
-
-        except Exception as e:
-            logger.error("[BASILICA] Failed to deploy!")
-            logger.error(f"   Error: {e}")
-            logger.error(traceback.format_exc())
-            if deployment is not None:
-                try:
-                    await deployment.delete_async()
-                    logger.info(f"[BASILICA] Cleaned up failed deployment '{deployment.name}'")
-                except Exception as del_err:
-                    logger.warning(f"[BASILICA] Failed to clean up deployment: {del_err}")
-            return None
 
     async def build_validator_image(self, env_path: Path | None = None) -> bool:
         """Build the validator's evaluation Docker image.

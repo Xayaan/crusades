@@ -15,6 +15,7 @@ Flow:
 """
 
 import ast
+import asyncio
 import gc
 import hashlib
 import importlib.util
@@ -25,6 +26,7 @@ import random
 import sys
 import time
 import traceback
+import uuid as _uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,6 +35,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from crusades.core.security_defs import (
@@ -2922,6 +2925,13 @@ class Actor:
 
 app = FastAPI(title="Templar MFU Evaluation", version="2.0.0")
 
+# ---------------------------------------------------------------------------
+# In-memory jobs table for async evaluation
+# ---------------------------------------------------------------------------
+# Maps job_id -> {"status": "pending"|"done"|"failed", "result": dict|None}
+_jobs: dict[str, dict] = {}
+_jobs_lock = asyncio.Lock()
+
 # Global actor instance (reused for efficiency)
 _actor: Actor | None = None
 
@@ -2989,11 +2999,81 @@ async def health():
     }
 
 
+_current_torchrun: asyncio.subprocess.Process | None = None
+
+
+def _get_descendant_pids(pid: int) -> list[int]:
+    """Recursively collect all descendant PIDs via /proc before killing."""
+    descendants: list[int] = []
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            child_pids = [int(p) for p in f.read().split()]
+        for cpid in child_pids:
+            descendants.append(cpid)
+            descendants.extend(_get_descendant_pids(cpid))
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+        pass
+    return descendants
+
+
+def _kill_torchrun_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL a torchrun process, its process group, AND all descendants.
+
+    torchrun's elastic agent may spawn workers in a different process group
+    than the launcher, so os.killpg alone is insufficient.  We walk
+    /proc/<pid>/children first (before any kill) to collect every descendant,
+    then kill the process group *and* each descendant individually.
+    """
+    import signal
+
+    if proc.returncode is not None:
+        return
+
+    pid = proc.pid
+
+    desc_pids = _get_descendant_pids(pid)
+
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL)
+        logger.warning(f"Killed torchrun process group (pgid={pgid})")
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    killed_extra = 0
+    for dpid in desc_pids:
+        try:
+            os.kill(dpid, signal.SIGKILL)
+            killed_extra += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if killed_extra:
+        logger.warning(f"Also killed {killed_extra} descendant processes of torchrun (pid={pid})")
+
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
 async def _evaluate_via_torchrun(request: EvaluateRequest) -> dict:
     """Spawn torchrun for multi-GPU Basilica evaluation (uvicorn is single-process)."""
+    global _current_torchrun
     import asyncio as _aio
     import json as _json
     import tempfile
+
+    if _current_torchrun is not None and _current_torchrun.returncode is None:
+        logger.warning(
+            f"Killing stale torchrun (pid={_current_torchrun.pid}) before new evaluation"
+        )
+        _kill_torchrun_group(_current_torchrun)
+        try:
+            await _aio.wait_for(_current_torchrun.wait(), timeout=10)
+        except TimeoutError:
+            logger.warning("Stale torchrun launcher did not exit within 10s after kill")
+        await _aio.sleep(30)
+    _current_torchrun = None
 
     params_path = None
     script_path = None
@@ -3039,14 +3119,19 @@ asyncio.run(main())
             f.write(eval_script)
             script_path = f.name
 
+        master_port = 29500 + random.randint(0, 10000)
         proc = await _aio.create_subprocess_exec(
             "torchrun",
             "--nproc_per_node",
             str(request.num_gpus),
+            "--master_port",
+            str(master_port),
             script_path,
             stdout=_aio.subprocess.PIPE,
             stderr=_aio.subprocess.STDOUT,
+            start_new_session=True,
         )
+        _current_torchrun = proc
 
         collected_lines: list[str] = []
 
@@ -3078,6 +3163,8 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     except TimeoutError:
+        if _current_torchrun is not None:
+            _kill_torchrun_group(_current_torchrun)
         return {
             "task_id": request.task_id,
             "success": False,
@@ -3089,6 +3176,8 @@ asyncio.run(main())
             "wall_time_seconds": 0.0,
         }
     except Exception as e:
+        if _current_torchrun is not None:
+            _kill_torchrun_group(_current_torchrun)
         return {
             "task_id": request.task_id,
             "success": False,
@@ -3108,39 +3197,100 @@ asyncio.run(main())
                     pass
 
 
-@app.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
-    """Evaluate miner's code. Spawns torchrun when num_gpus > 1."""
+async def _run_evaluation(request: EvaluateRequest) -> dict:
+    """Run the actual evaluation (sync helper used by background task)."""
     if request.num_gpus > 1:
-        result = await _evaluate_via_torchrun(request)
-    else:
-        actor = get_actor()
-        result = await actor.evaluate(
-            task_id=request.task_id,
-            seed=request.seed,
-            model_url=request.model_url,
-            data_url=request.data_url,
-            steps=request.steps,
-            batch_size=request.batch_size,
-            timeout=request.timeout,
-            sequence_length=request.sequence_length,
-            data_samples=request.data_samples,
-            code=request.code,
-            max_loss_difference=request.max_loss_difference,
-            use_random_init=request.use_random_init,
-            min_trainable_params_ratio=request.min_trainable_params_ratio,
-            min_params_changed_ratio=request.min_params_changed_ratio,
-            weight_relative_error_max=request.weight_relative_error_max,
-            timer_divergence_threshold=request.timer_divergence_threshold,
-            gpu_peak_tflops=request.gpu_peak_tflops,
-            max_plausible_mfu=request.max_plausible_mfu,
-            min_mfu=request.min_mfu,
-            require_cuda_timing=True,
-            num_gpus=request.num_gpus,
-        )
+        return await _evaluate_via_torchrun(request)
 
-    return EvaluateResponse(
-        task_id=result.get("task_id", request.task_id),
+    actor = get_actor()
+    return await actor.evaluate(
+        task_id=request.task_id,
+        seed=request.seed,
+        model_url=request.model_url,
+        data_url=request.data_url,
+        steps=request.steps,
+        batch_size=request.batch_size,
+        timeout=request.timeout,
+        sequence_length=request.sequence_length,
+        data_samples=request.data_samples,
+        code=request.code,
+        max_loss_difference=request.max_loss_difference,
+        use_random_init=request.use_random_init,
+        min_trainable_params_ratio=request.min_trainable_params_ratio,
+        min_params_changed_ratio=request.min_params_changed_ratio,
+        weight_relative_error_max=request.weight_relative_error_max,
+        timer_divergence_threshold=request.timer_divergence_threshold,
+        gpu_peak_tflops=request.gpu_peak_tflops,
+        max_plausible_mfu=request.max_plausible_mfu,
+        min_mfu=request.min_mfu,
+        require_cuda_timing=True,
+        num_gpus=request.num_gpus,
+    )
+
+
+async def _evaluation_background(job_id: str, request: EvaluateRequest) -> None:
+    """Background coroutine: runs evaluation and stores result in _jobs."""
+    try:
+        result = await _run_evaluation(request)
+        async with _jobs_lock:
+            _jobs[job_id] = {"status": "done", "result": result}
+        logger.info(f"[JOB {job_id}] Evaluation finished successfully")
+    except Exception as exc:
+        error_result = {
+            "task_id": request.task_id,
+            "success": False,
+            "error": f"Background evaluation failed: {exc}",
+            "seed": request.seed,
+            "mfu": 0.0,
+            "tps": 0.0,
+            "total_tokens": 0,
+            "wall_time_seconds": 0.0,
+        }
+        async with _jobs_lock:
+            _jobs[job_id] = {"status": "failed", "result": error_result}
+        logger.error(f"[JOB {job_id}] Evaluation failed: {exc}")
+
+
+@app.post("/evaluate")
+async def evaluate(request: EvaluateRequest):
+    """Accept evaluation request, start in background, return job_id immediately.
+
+    Returns HTTP 202 with {"job_id": "..."} so the caller can poll
+    GET /eval-status/{job_id} for results. This avoids proxy timeouts
+    on long-running evaluations.
+    """
+    job_id = _uuid.uuid4().hex
+    async with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "result": None}
+    asyncio.create_task(_evaluation_background(job_id, request))
+    logger.info(
+        f"[JOB {job_id}] Evaluation accepted (task_id={request.task_id}, "
+        f"num_gpus={request.num_gpus})"
+    )
+    return JSONResponse(status_code=202, content={"job_id": job_id})
+
+
+@app.get("/eval-status/{job_id}")
+async def eval_status(job_id: str):
+    """Poll for evaluation result.
+
+    Returns:
+        - 200 {"status": "pending"}              while evaluation is running
+        - 200 {"status": "done", "result": {...}} when evaluation is complete
+        - 200 {"status": "failed", "result": {...}} on evaluation error
+        - 404 {"error": "unknown job_id"}         if job_id is not found
+    """
+    async with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "unknown job_id"})
+
+    if job["status"] == "pending":
+        return {"status": "pending"}
+
+    result = job["result"]
+    response = EvaluateResponse(
+        task_id=result.get("task_id", 0),
         mfu=result.get("mfu", 0.0),
         tps=result.get("tps", 0.0),
         total_tokens=result.get("total_tokens", 0),
@@ -3148,9 +3298,13 @@ async def evaluate(request: EvaluateRequest) -> EvaluateResponse:
         success=result.get("success", False),
         error=result.get("error"),
         error_code=result.get("error_code"),
-        seed=result.get("seed", request.seed),
+        seed=result.get("seed", ""),
         diagnostics=result.get("diagnostics", {}),
     )
+    # Clean up to avoid unbounded memory growth
+    async with _jobs_lock:
+        _jobs.pop(job_id, None)
+    return {"status": job["status"], "result": response.model_dump()}
 
 
 # Entry point when running directly (for local testing)
