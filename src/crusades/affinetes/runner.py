@@ -849,88 +849,94 @@ asyncio.run(main())
             # ── Step 2: Poll /eval-status/{job_id} until done ──
             poll_url = f"{deployment.url}/eval-status/{job_id}"
             poll_interval = 30
-            max_consecutive_errors = 10
             consecutive_errors = 0
+            poll_timeout = httpx.Timeout(connect=10, read=60, write=10, pool=10)
 
-            while True:
-                elapsed = time.time() - post_start
-                if elapsed >= http_timeout:
-                    logger.error(
-                        f"[BASILICA] Polling timeout after {elapsed:.0f}s (budget: {http_timeout}s)"
+            async with httpx.AsyncClient(timeout=poll_timeout) as poll_client:
+                while True:
+                    elapsed = time.time() - post_start
+                    if elapsed >= http_timeout:
+                        logger.error(
+                            f"[BASILICA] Polling timeout after {elapsed:.0f}s (budget: {http_timeout}s)"
+                        )
+                        return EvaluationResult.failure(
+                            f"Basilica evaluation timed out after {elapsed:.0f}s (polling)",
+                            task_id=task_id,
+                        )
+
+                    remaining = http_timeout - elapsed
+                    max_consecutive_errors = max(
+                        10, int(remaining // (poll_interval + poll_timeout.read))
                     )
-                    return EvaluationResult.failure(
-                        f"Basilica evaluation timed out after {elapsed:.0f}s (polling)",
-                        task_id=task_id,
-                    )
 
-                await asyncio.sleep(poll_interval)
-                elapsed = time.time() - post_start
+                    await asyncio.sleep(poll_interval)
+                    elapsed = time.time() - post_start
 
-                try:
-                    async with httpx.AsyncClient(timeout=30) as poll_client:
+                    try:
                         poll_resp = await poll_client.get(poll_url)
 
-                    consecutive_errors = 0
+                        consecutive_errors = 0
 
-                    if poll_resp.status_code == 404:
-                        logger.warning(
-                            f"[BASILICA] Job {job_id} not found (404) — "
-                            f"container may have restarted"
-                        )
-                        return EvaluationResult.failure(
-                            f"Basilica job {job_id} lost (404 on poll)",
-                            task_id=task_id,
-                        )
-
-                    if poll_resp.status_code != 200:
-                        logger.warning(
-                            f"[BASILICA] Poll got {poll_resp.status_code}, "
-                            f"will retry in {poll_interval}s ({elapsed:.0f}s elapsed)"
-                        )
-                        continue
-
-                    poll_data = poll_resp.json()
-                    status = poll_data.get("status")
-
-                    if status == "pending":
-                        logger.info(
-                            f"   [POLLING] Evaluation in progress... {elapsed:.0f}s elapsed"
-                        )
-                        continue
-
-                    if status in ("done", "failed"):
-                        result_data = poll_data.get("result")
-                        if result_data is None:
+                        if poll_resp.status_code == 404:
+                            logger.warning(
+                                f"[BASILICA] Job {job_id} not found (404) — "
+                                f"container may have restarted"
+                            )
                             return EvaluationResult.failure(
-                                f"Basilica job {job_id} status={status} but no result",
+                                f"Basilica job {job_id} lost (404 on poll)",
                                 task_id=task_id,
                             )
-                        logger.info(
-                            f"[BASILICA] Job {job_id} completed with status={status} "
-                            f"in {elapsed:.1f}s"
-                        )
-                        break
 
-                    logger.warning(
-                        f"[BASILICA] Unknown poll status: {status}, will retry in {poll_interval}s"
-                    )
+                        if poll_resp.status_code != 200:
+                            logger.warning(
+                                f"[BASILICA] Poll got {poll_resp.status_code}, "
+                                f"will retry in {poll_interval}s ({elapsed:.0f}s elapsed)"
+                            )
+                            continue
 
-                except (
-                    httpx.TimeoutException,
-                    httpx.ConnectError,
-                    httpx.RemoteProtocolError,
-                ) as poll_err:
-                    consecutive_errors += 1
-                    logger.warning(
-                        f"[BASILICA] Poll error ({consecutive_errors}/{max_consecutive_errors}): "
-                        f"{type(poll_err).__name__}: {poll_err}"
-                    )
-                    if consecutive_errors >= max_consecutive_errors:
-                        return EvaluationResult.failure(
-                            f"Basilica polling failed {max_consecutive_errors} times: {poll_err}",
-                            task_id=task_id,
+                        poll_data = poll_resp.json()
+                        status = poll_data.get("status")
+
+                        if status == "pending":
+                            logger.info(
+                                f"   [POLLING] Evaluation in progress... {elapsed:.0f}s elapsed"
+                            )
+                            continue
+
+                        if status in ("done", "failed"):
+                            result_data = poll_data.get("result")
+                            if result_data is None:
+                                return EvaluationResult.failure(
+                                    f"Basilica job {job_id} status={status} but no result",
+                                    task_id=task_id,
+                                )
+                            logger.info(
+                                f"[BASILICA] Job {job_id} completed with status={status} "
+                                f"in {elapsed:.1f}s"
+                            )
+                            break
+
+                        logger.warning(
+                            f"[BASILICA] Unknown poll status: {status}, will retry in {poll_interval}s"
                         )
-                    continue
+
+                    except (
+                        httpx.TimeoutException,
+                        httpx.ConnectError,
+                        httpx.RemoteProtocolError,
+                    ) as poll_err:
+                        consecutive_errors += 1
+                        logger.warning(
+                            f"[BASILICA] Poll error ({consecutive_errors}/{max_consecutive_errors}): "
+                            f"{type(poll_err).__name__} ({elapsed:.0f}s elapsed)"
+                        )
+                        if consecutive_errors >= max_consecutive_errors:
+                            return EvaluationResult.failure(
+                                f"Basilica polling failed {max_consecutive_errors} consecutive "
+                                f"times after {elapsed:.0f}s: {poll_err}",
+                                task_id=task_id,
+                            )
+                        continue
 
             elapsed = time.time() - post_start
             logger.info(f"[BASILICA] Evaluation result received in {elapsed:.1f}s")

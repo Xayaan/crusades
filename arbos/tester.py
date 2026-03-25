@@ -7,10 +7,12 @@ Local mode:    runs the evaluation inside a local Docker container with GPUs.
 import asyncio
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,11 +22,13 @@ import httpx
 logger = logging.getLogger("arbos.tester")
 
 try:
-    from basilica import BasilicaClient
+    from basilica import BasilicaClient, DeploymentFailed, DeploymentTimeout
 
     BASILICA_AVAILABLE = True
 except ImportError:
     BasilicaClient = None
+    DeploymentFailed = None
+    DeploymentTimeout = None
     BASILICA_AVAILABLE = False
 
 
@@ -96,8 +100,56 @@ class BasilicaTester:
             "gpu_peak_tflops": m["gpu_peak_tflops"],
             "max_plausible_mfu": m["max_plausible_mfu"],
             "min_mfu": m["min_mfu"],
-            "num_gpus": self._bconfig.get("gpu_count", h.get("docker", {}).get("num_gpus", 2)),
+            "num_gpus": self._bconfig.get("gpu_count", h.get("docker", {}).get("num_gpus", 4)),
         }
+
+    async def _stream_logs(self, deployment, log_path: Path, poll_interval: int = 5):
+        """Poll Basilica deployment logs and write them to a local file."""
+        loop = asyncio.get_event_loop()
+        last_len = 0
+        consecutive_errors = 0
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            dep_name = getattr(deployment, "name", "unknown")
+            with open(log_path, "w") as f:
+                f.write(f"# Basilica logs for arbos deployment {dep_name}\n")
+                f.write(f"# Started: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+                f.write(f"# Poll interval: {poll_interval}s\n\n")
+
+            while True:
+                try:
+                    raw = await loop.run_in_executor(None, deployment.logs)
+                    if raw and len(raw) > last_len:
+                        with open(log_path, "a") as f:
+                            f.write(raw[last_len:])
+                        last_len = len(raw)
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    logger.debug(f"[ARBOS-LOGS] Poll error #{consecutive_errors}: {e}")
+                    if consecutive_errors >= 5:
+                        logger.warning(
+                            f"[ARBOS-LOGS] {consecutive_errors} consecutive poll"
+                            " failures — container may have crashed"
+                        )
+                        with open(log_path, "a") as f:
+                            ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+                            f.write(
+                                f"\n--- POLL FAILURE x{consecutive_errors} at {ts} ---\n"
+                                f"--- Last error: {e} ---\n"
+                            )
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            try:
+                raw = await loop.run_in_executor(None, deployment.logs)
+                if raw and len(raw) > last_len:
+                    with open(log_path, "a") as f:
+                        f.write(raw[last_len:])
+            except Exception:
+                pass
+            with open(log_path, "a") as f:
+                f.write(f"\n# Ended: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+            logger.info(f"[ARBOS-LOGS] Saved to {log_path}")
 
     async def _evaluate_async(self, code: str) -> EvalResult:
         if not BASILICA_AVAILABLE:
@@ -109,85 +161,242 @@ class BasilicaTester:
         bc = self._bconfig
         deploy_name = f"arbos-eval-{uuid.uuid4().hex[:8]}"
         deployment = None
+        log_stream_task = None
+        start_time = time.time()
+        http_timeout = max(self._eval_timeout + 600, 1800)
 
         try:
-            # --- Create deployment ---
+            # --- Create deployment via deploy_async (high-level API) ---
             logger.info("Creating Basilica deployment...")
-            logger.info(f"  GPU: {bc.get('gpu_count', 2)}x {bc.get('gpu_models', ['A100'])}")
+            logger.info(f"  GPU: {bc.get('gpu_count', 4)}x {bc.get('gpu_models', ['A100'])}")
             logger.info(f"  Image: {bc.get('image', 'ghcr.io/one-covenant/templar-eval:latest')}")
+            logger.info(f"  CPU: {bc.get('cpu', '24')}, Memory: {bc.get('memory', '480Gi')}")
+            if bc.get("interconnect"):
+                logger.info(f"  Interconnect: {bc['interconnect']}")
+            logger.info(f"  TTL: {self._ttl}s ({self._ttl / 60:.0f} min)")
             logger.info(f"  Name: {deploy_name}")
 
             client = BasilicaClient()
             deploy_kwargs = {
-                "instance_name": deploy_name,
+                "name": deploy_name,
                 "image": bc.get("image", "ghcr.io/one-covenant/templar-eval:latest"),
                 "port": 8000,
                 "ttl_seconds": self._ttl,
-                "gpu_count": bc.get("gpu_count", 2),
+                "gpu_count": bc.get("gpu_count", 4),
                 "gpu_models": bc.get("gpu_models", ["A100"]),
                 "min_gpu_memory_gb": bc.get("min_gpu_memory_gb", 80),
-                "cpu": bc.get("cpu", "8"),
-                "memory": bc.get("memory", "160Gi"),
+                "cpu": bc.get("cpu", "24"),
+                "memory": bc.get("memory", "480Gi"),
+                "timeout": 1800,
             }
             if bc.get("interconnect"):
                 deploy_kwargs["interconnect"] = bc["interconnect"]
             if bc.get("geo"):
                 deploy_kwargs["geo"] = bc["geo"]
+            if bc.get("spot"):
+                deploy_kwargs["spot"] = bc["spot"]
 
             deploy_start = time.time()
-            response = await client.create_deployment_async(**deploy_kwargs)
-            deployment = await client.get_async(response.instance_name)
-            logger.info(f"  Basilica ID: {deployment.name}")
-
-            logger.info(f"Waiting for deployment to be ready (timeout: {self._eval_timeout}s)...")
-            await deployment.wait_until_ready_async(timeout=self._eval_timeout)
-            await deployment.refresh_async()
-
+            deployment = await client.deploy_async(**deploy_kwargs)
             deploy_elapsed = time.time() - deploy_start
-            logger.info(f"Deployment ready in {deploy_elapsed:.0f}s at {deployment.url}")
 
-            # --- Send evaluation ---
+            dep_name = getattr(deployment, "name", None) or getattr(deployment, "id", "unknown")
+            logger.info(f"Deployment ready in {deploy_elapsed:.0f}s")
+            logger.info(f"  URL: {deployment.url}")
+            logger.info(f"  Deployment ID: {dep_name}")
+
+            # --- Start log streaming ---
+            log_dir = Path("arbos/logs/basilica")
+            log_file = log_dir / f"{dep_name}_{int(time.time())}.log"
+            log_stream_task = asyncio.create_task(self._stream_logs(deployment, log_file))
+            logger.info(f"  Log streaming started → {log_file}")
+
+            # --- Submit evaluation job ---
             payload = self._build_payload(code)
-            http_timeout = self._eval_timeout + 600
 
-            logger.info("Sending evaluation request...")
+            logger.info("Submitting evaluation job...")
             logger.info(f"  URL: {deployment.url}/evaluate")
-            logger.info(f"  HTTP timeout: {http_timeout}s")
+            logger.info(f"  Timeout budget: {http_timeout}s")
             eval_start = time.time()
 
-            async with httpx.AsyncClient(timeout=http_timeout) as http:
-                resp = await http.post(f"{deployment.url}/evaluate", json=payload)
+            async with httpx.AsyncClient(timeout=60) as submit_client:
+                submit_resp = await submit_client.post(f"{deployment.url}/evaluate", json=payload)
 
-            eval_elapsed = time.time() - eval_start
-            logger.info(f"Response received in {eval_elapsed:.0f}s (HTTP {resp.status_code})")
-
-            if resp.status_code != 200:
+            if submit_resp.status_code not in (200, 202):
                 return EvalResult(
                     success=False,
-                    error=f"HTTP {resp.status_code}: {resp.text[:500]}",
+                    error=f"Job submission failed: HTTP {submit_resp.status_code}: "
+                    f"{submit_resp.text[:500]}",
                 )
 
-            data = resp.json()
+            submit_data = submit_resp.json()
+            job_id = submit_data.get("job_id")
+            if not job_id:
+                return EvalResult(
+                    success=False,
+                    error=f"/evaluate did not return job_id: {submit_data}",
+                )
+
+            logger.info(f"  Job accepted: {job_id}")
+
+            # --- Poll /eval-status/{job_id} until done ---
+            poll_url = f"{deployment.url}/eval-status/{job_id}"
+            poll_interval = 30
+            consecutive_errors = 0
+            poll_timeout = httpx.Timeout(connect=10, read=60, write=10, pool=10)
+
+            async with httpx.AsyncClient(timeout=poll_timeout) as poll_client:
+                while True:
+                    elapsed = time.time() - eval_start
+                    if elapsed >= http_timeout:
+                        return EvalResult(
+                            success=False,
+                            error=f"Polling timed out after {elapsed:.0f}s "
+                            f"(budget: {http_timeout}s)",
+                        )
+
+                    remaining = http_timeout - elapsed
+                    max_consecutive_errors = max(
+                        10, int(remaining // (poll_interval + poll_timeout.read))
+                    )
+
+                    await asyncio.sleep(poll_interval)
+                    elapsed = time.time() - eval_start
+
+                    try:
+                        poll_resp = await poll_client.get(poll_url)
+                        consecutive_errors = 0
+
+                        if poll_resp.status_code == 404:
+                            return EvalResult(
+                                success=False,
+                                error=f"Job {job_id} lost (404 on poll) — "
+                                "container may have restarted",
+                            )
+
+                        if poll_resp.status_code != 200:
+                            logger.warning(
+                                f"Poll got {poll_resp.status_code}, retrying "
+                                f"in {poll_interval}s ({elapsed:.0f}s elapsed)"
+                            )
+                            continue
+
+                        poll_data = poll_resp.json()
+                        status = poll_data.get("status")
+
+                        if status == "pending":
+                            logger.info(
+                                f"  [POLLING] Evaluation in progress... {elapsed:.0f}s elapsed"
+                            )
+                            continue
+
+                        if status in ("done", "failed"):
+                            result_data = poll_data.get("result")
+                            if result_data is None:
+                                return EvalResult(
+                                    success=False,
+                                    error=f"Job {job_id} status={status} but no result",
+                                )
+                            logger.info(
+                                f"  Job {job_id} completed: status={status} in {elapsed:.0f}s"
+                            )
+                            break
+
+                        logger.warning(
+                            f"Unknown poll status: {status}, retrying in {poll_interval}s"
+                        )
+
+                    except (
+                        httpx.TimeoutException,
+                        httpx.ConnectError,
+                        httpx.RemoteProtocolError,
+                    ) as poll_err:
+                        consecutive_errors += 1
+                        logger.warning(
+                            f"Poll error ({consecutive_errors}/"
+                            f"{max_consecutive_errors}): "
+                            f"{type(poll_err).__name__} ({elapsed:.0f}s elapsed)"
+                        )
+                        if consecutive_errors >= max_consecutive_errors:
+                            return EvalResult(
+                                success=False,
+                                error=f"Polling failed {max_consecutive_errors} "
+                                f"consecutive times after {elapsed:.0f}s: {poll_err}",
+                            )
+                        continue
+
+            eval_elapsed = time.time() - eval_start
+            logger.info(f"Evaluation result received in {eval_elapsed:.0f}s")
+
+            # --- Validate result ---
+            if not isinstance(result_data, dict):
+                return EvalResult(
+                    success=False,
+                    error=f"Result is not a dict: {type(result_data).__name__}",
+                )
+
+            for numeric_field in ("mfu", "tps", "wall_time_seconds"):
+                if numeric_field in result_data:
+                    value = float(result_data[numeric_field])
+                    if not math.isfinite(value):
+                        return EvalResult(
+                            success=False,
+                            error=f"Result has non-finite {numeric_field}: {value}",
+                        )
+
             return EvalResult(
-                success=data.get("success", False),
-                mfu=float(data.get("mfu", 0.0)),
-                tps=float(data.get("tps", 0.0)),
-                total_tokens=int(data.get("total_tokens", 0)),
-                wall_time=float(data.get("wall_time_seconds", 0.0)),
-                error=data.get("error"),
-                error_code=data.get("error_code"),
-                diagnostics=data.get("diagnostics", {}),
+                success=result_data.get("success", False),
+                mfu=float(result_data.get("mfu", 0.0)),
+                tps=float(result_data.get("tps", 0.0)),
+                total_tokens=int(result_data.get("total_tokens", 0)),
+                wall_time=float(result_data.get("wall_time_seconds", 0.0)),
+                error=result_data.get("error"),
+                error_code=result_data.get("error_code"),
+                diagnostics=result_data.get("diagnostics", {}),
             )
 
-        except httpx.TimeoutException:
+        except DeploymentTimeout as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Deployment timed out after {elapsed:.0f}s: {e}")
             return EvalResult(
-                success=False, error=f"Evaluation timed out after {self._eval_timeout}s"
+                success=False,
+                error=f"Basilica deployment timeout after {elapsed:.0f}s: {e}",
+            )
+        except DeploymentFailed as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Deployment failed after {elapsed:.0f}s: {e}")
+            return EvalResult(success=False, error=f"Basilica deployment failed: {e}")
+        except (TimeoutError, httpx.TimeoutException) as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Timeout after {elapsed:.0f}s: {type(e).__name__}: {e}")
+            return EvalResult(
+                success=False,
+                error=f"Basilica timeout after {elapsed:.0f}s: {e}",
+            )
+        except httpx.ConnectError as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Connection error after {elapsed:.0f}s: {e}")
+            return EvalResult(success=False, error=f"Basilica connection error: {e}")
+        except httpx.RemoteProtocolError as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Remote protocol error after {elapsed:.0f}s: {e}")
+            return EvalResult(
+                success=False,
+                error=f"Basilica remote protocol error after {elapsed:.0f}s: {e}",
             )
         except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Error after {elapsed:.0f}s: {e}")
+            logger.error(traceback.format_exc())
             return EvalResult(success=False, error=str(e))
 
         finally:
-            # --- Always delete deployment ---
+            if log_stream_task is not None:
+                log_stream_task.cancel()
+                try:
+                    await log_stream_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if deployment is not None:
                 try:
                     await deployment.delete_async()
@@ -264,6 +473,7 @@ class LocalDockerTester:
         self._num_gpus = num_gpus or self._docker_cfg.get("num_gpus", 2)
         self._gpu_devices = gpu_devices
         self._eval_timeout = hparams.get("eval_timeout", 3600)
+        self._session_id = f"arbos-{uuid.uuid4().hex[:12]}"
 
         if project_root is None:
             project_root = Path(__file__).parent.parent
@@ -309,6 +519,8 @@ class LocalDockerTester:
             "docker",
             "run",
             "--rm",
+            "--label",
+            f"arbos.session={self._session_id}",
             "--gpus",
             gpu_flag,
             "--ipc=host",
@@ -378,12 +590,19 @@ class LocalDockerTester:
     def _post_run_cleanup(self):
         """Clean up GPU state and /dev/shm after a Docker run.
 
-        Kills any leftover templar-eval containers and clears NCCL shared
-        memory segments so the next run starts with a clean slate.
+        Only kills containers started by THIS arbos session (identified by
+        the ``arbos.session`` label) so manually launched test containers
+        and other arbos instances are not affected.
         """
         try:
             leftover = subprocess.run(
-                ["docker", "ps", "-q", "--filter", f"ancestor={self._image}"],
+                [
+                    "docker",
+                    "ps",
+                    "-q",
+                    "--filter",
+                    f"label=arbos.session={self._session_id}",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,

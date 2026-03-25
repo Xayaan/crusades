@@ -325,8 +325,8 @@ def _reset_torch_state():
 
 def _enforce_backend_state():
     """Set torch backend settings to canonical values."""
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.enable_flash_sdp(True)
@@ -337,9 +337,9 @@ def _enforce_backend_state():
 def _check_backend_state() -> list[str]:
     """Check torch backend settings. Returns list of violations."""
     violations = []
-    if torch.backends.cudnn.deterministic:
+    if not torch.backends.cudnn.deterministic:
         violations.append("cudnn.deterministic")
-    if not torch.backends.cudnn.benchmark:
+    if torch.backends.cudnn.benchmark:
         violations.append("cudnn.benchmark")
     if not torch.backends.cudnn.allow_tf32:
         violations.append("cudnn.allow_tf32")
@@ -905,6 +905,18 @@ def _scan_for_dangerous_patterns(tree: ast.AST) -> tuple[bool, str | None]:
                 line = getattr(node, "lineno", "?")
                 return False, f"Line {line}: accessing .optimizer attribute is forbidden"
 
+        # Block method/function definitions whose name is a forbidden dunder.
+        # e.g. `def __getattribute__` inside a class bypasses the ast.Attribute
+        # check above because the name lives in FunctionDef.name, not in an
+        # Attribute node.  This closes the proxy-object exploit vector.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in FORBIDDEN_INTROSPECTION_ATTRS:
+                line = getattr(node, "lineno", "?")
+                return False, (
+                    f"Line {line}: defining method '{node.name}' is forbidden "
+                    f"(proxy/deferred-computation vector)"
+                )
+
         # Block dangerous builtins used as decorators (e.g. @property, @staticmethod)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for deco in node.decorator_list:
@@ -1060,20 +1072,26 @@ def _validate_code_structure(code: str) -> tuple[bool, str | None]:
 def _validate_return_type(result) -> tuple[bool, str | None, InnerStepsResult | None]:
     """Validate that inner_steps returned correct type.
 
-    Rejects proxy/lazy objects that override __getattr__ to defer computation,
-    which is a known exploit vector for faking MFU.
+    Rejects proxy/lazy objects that override attribute-access or descriptor
+    hooks to defer computation, which is a known exploit vector for faking MFU.
     """
     if isinstance(result, InnerStepsResult):
         return True, None, result
 
+    _proxy_hooks = ("__getattr__", "__getattribute__", "__get__", "__set__", "__set_name__")
     result_type = type(result)
-    if any("__getattr__" in cls.__dict__ for cls in result_type.__mro__):
-        return (
-            False,
-            f"Rejected proxy/lazy return type {result_type.__name__}: "
-            f"__getattr__ override detected (deferred computation not allowed)",
-            None,
-        )
+    for cls in result_type.__mro__:
+        if cls is object:
+            continue
+        for hook in _proxy_hooks:
+            if hook in cls.__dict__:
+                return (
+                    False,
+                    f"Rejected proxy/lazy return type {result_type.__name__}: "
+                    f"{hook} override detected in {cls.__name__} "
+                    f"(deferred computation not allowed)",
+                    None,
+                )
 
     if all(hasattr(result, attr) for attr in ("final_logits", "total_tokens", "final_loss")):
         return (
@@ -2347,6 +2365,10 @@ class Actor:
 
             # Access final_state OUTSIDE the timer (verification-only).
             # Guard against lazy values by checking each tensor is real.
+            # Also time this access: legitimate FSDP all-gather is fast relative
+            # to training; if this takes a large fraction of wall_time, the miner
+            # deferred real training compute into the state-gathering path.
+            _state_access_start = _pc()
             _mat_state = getattr(miner_result, "final_state", None)
             if isinstance(_mat_state, dict):
                 for _sk, _sv in _mat_state.items():
@@ -2354,9 +2376,18 @@ class Actor:
                         _sv.data_ptr()
                     elif _sv is not None and not isinstance(_sv, (int, float, bool, str)):
                         _state_vtype = type(_sv)
+                        _sv_proxy_hooks = (
+                            "__getattr__",
+                            "__getattribute__",
+                            "__get__",
+                            "__set__",
+                            "__set_name__",
+                        )
                         if any(
-                            "__getattr__" in cls.__dict__ or "__get__" in cls.__dict__
+                            hook in cls.__dict__
                             for cls in _state_vtype.__mro__
+                            if cls is not object
+                            for hook in _sv_proxy_hooks
                         ):
                             logger.error(
                                 f"Lazy/proxy object detected in final_state['{_sk}']: "
@@ -2364,6 +2395,35 @@ class Actor:
                             )
                             _mat_state = None
                             break
+            _sy()
+            _state_access_elapsed = _pc() - _state_access_start
+            _training_wall = end_perf - start_perf
+            _state_time_ratio_max = 0.5
+            if (
+                _training_wall > 0
+                and _state_access_elapsed > _state_time_ratio_max * _training_wall
+            ):
+                logger.error(
+                    f"final_state access took {_state_access_elapsed:.2f}s "
+                    f"({_state_access_elapsed / _training_wall:.0%} of training wall_time "
+                    f"{_training_wall:.2f}s) — likely deferred computation"
+                )
+                return {
+                    "task_id": task_id,
+                    "mfu": 0.0,
+                    "tps": 0.0,
+                    "total_tokens": 0,
+                    "wall_time_seconds": _training_wall,
+                    "success": False,
+                    "error": (
+                        f"Deferred computation detected: final_state access took "
+                        f"{_state_access_elapsed:.2f}s ({_state_access_elapsed / _training_wall:.0%} "
+                        f"of {_training_wall:.2f}s training time)"
+                    ),
+                    "error_code": "deferred_computation",
+                    "seed": seed,
+                    "code": code,
+                }
 
             # Post-eval tamper check on module-level refs
             if not _runtime_ids_ok():
@@ -2455,39 +2515,15 @@ class Actor:
             # not training compute — exclude it from MFU.
             if _multi_gpu:
                 _wt = torch.tensor([wall_time], dtype=torch.float64, device=device)
-                _wt_max_t = _wt.clone()
                 dist.all_reduce(_wt, op=dist.ReduceOp.MIN)
-                dist.all_reduce(_wt_max_t, op=dist.ReduceOp.MAX)
                 _wt_min = _wt.item()
-                _wt_max = _wt_max_t.item()
-                _wt_rel_div = (_wt_max - _wt_min) / max(_wt_max, 1e-9)
-                if _wt_rel_div > 0.20:
-                    logger.error(
-                        f"Rank wall_time divergence too high: "
-                        f"min={_wt_min:.2f}s max={_wt_max:.2f}s "
-                        f"relative_divergence={_wt_rel_div:.1%}"
-                    )
-                    return {
-                        "task_id": task_id,
-                        "mfu": 0.0,
-                        "tps": 0.0,
-                        "total_tokens": 0,
-                        "wall_time_seconds": _wt_max,
-                        "success": False,
-                        "error": f"Rank wall_time divergence {_wt_rel_div:.1%} exceeds 20% threshold "
-                        f"(min={_wt_min:.2f}s, max={_wt_max:.2f}s). "
-                        f"Possible asymmetric work distribution.",
-                        "error_code": "wall_time_divergence",
-                        "seed": seed,
-                        "code": code,
-                    }
                 if wall_time - _wt_min > 0.5:
                     logger.info(
                         f"Using min wall_time across ranks: {_wt_min:.2f}s "
                         f"(rank 0 measured {wall_time:.2f}s, "
                         f"delta={wall_time - _wt_min:.2f}s verification overhead)"
                     )
-                    wall_time = _wt_min
+                wall_time = _wt_min
 
             # Non-rank-0: skip verification (barrier in finally block)
             if not _IS_RANK_0:

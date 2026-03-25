@@ -19,7 +19,7 @@ same Docker container.
         -e NCCL_NVLS_ENABLE=1 \
         -e NCCL_IB_DISABLE=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        -v "$(pwd)/local_test/train_mixed.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/train.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
@@ -37,7 +37,7 @@ same Docker container.
         -e NCCL_NVLS_ENABLE=1 \
         -e NCCL_IB_DISABLE=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        -v "$(pwd)/local_test/train_mixed.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/train.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
