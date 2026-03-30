@@ -397,6 +397,7 @@ def _resolve_tokenizer_path(tokenizer_name: str) -> str:
     return tokenizer_name
 
 
+
 def _resize_model_for_tokenizer(model) -> None:
     """Resize model embeddings if a separate tokenizer with different vocab is configured."""
     tokenizer_name = _get_hparams_tokenizer_name()
@@ -417,7 +418,6 @@ def _resize_model_for_tokenizer(model) -> None:
             f"Resizing model embeddings: {model_vocab} -> {new_vocab} (tokenizer: {tokenizer_name})"
         )
         model.resize_token_embeddings(new_vocab)
-
 
 
 def _load_hf_dataset(
@@ -2200,6 +2200,52 @@ class Actor:
                     "code": code,
                 }
 
+            # Verify trainable params on the pristine model BEFORE warmup.
+            # Must run here because miner inner_steps (e.g. PP) may freeze
+            # layers in-place, making a post-warmup check unreliable.
+            trainable_fail_result = None
+            if _IS_RANK_0:
+                trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
+                    model, min_trainable_params_ratio
+                )
+                if not trainable_ok:
+                    trainable_fail_result = {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": trainable_error,
+                        "error_code": "insufficient_trainable_params",
+                        "seed": seed,
+                        "code": code,
+                        "diagnostics": {"trainable_params": trainable_details},
+                    }
+                else:
+                    logger.info("Trainable params check passed on pristine model")
+
+            if _multi_gpu:
+                local_fail = 1 if trainable_fail_result is not None else 0
+                fail_tensor = torch.tensor([local_fail], dtype=torch.int32, device=device)
+                dist.all_reduce(fail_tensor, op=dist.ReduceOp.MAX)
+                if fail_tensor.item() > 0:
+                    if trainable_fail_result is not None:
+                        return trainable_fail_result
+                    return {
+                        "task_id": task_id,
+                        "mfu": 0.0,
+                        "tps": 0.0,
+                        "total_tokens": 0,
+                        "wall_time_seconds": 0.0,
+                        "success": False,
+                        "error": "Trainable params check failed on rank 0",
+                        "seed": seed,
+                        "code": code,
+                    }
+            elif trainable_fail_result is not None:
+                return trainable_fail_result
+
             # Warmup uses randomized weights and a random data offset.
             # The real initial_state is restored after warmup completes.
             with torch.no_grad():
@@ -2294,23 +2340,6 @@ class Actor:
 
                     if warmup_failure is None:
                         logger.info("Warmup passed - proceeding with verification checks")
-                        trainable_ok, trainable_error, trainable_details = _verify_trainable_params(
-                            model, min_trainable_params_ratio
-                        )
-                        if not trainable_ok:
-                            warmup_failure = {
-                                "task_id": task_id,
-                                "mfu": 0.0,
-                                "tps": 0.0,
-                                "total_tokens": 0,
-                                "wall_time_seconds": 0.0,
-                                "success": False,
-                                "error": trainable_error,
-                                "error_code": "insufficient_trainable_params",
-                                "seed": seed,
-                                "code": code,
-                                "diagnostics": {"trainable_params": trainable_details},
-                            }
 
             except Exception as e:
                 error_msg = f"Early termination (warmup failed): {type(e).__name__}: {str(e)}"

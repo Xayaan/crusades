@@ -21,18 +21,20 @@ RUN pip install --no-cache-dir --user \
 COPY --chown=appuser:appuser hparams/hparams.json /app/
 COPY --chown=appuser:appuser tokenizers/ /app/tokenizers/
 
-RUN python -c "\
-import json; \
+RUN --mount=type=secret,id=HF_TOKEN python -c "\
+import json, os, pathlib; \
+secret = pathlib.Path('/run/secrets/HF_TOKEN'); \
+token = secret.read_text().strip() if secret.exists() else None; \
 cfg = json.load(open('/app/hparams.json')); \
 model = cfg['benchmark_model_name']; \
 tokenizer_name = cfg.get('benchmark_tokenizer_name', ''); \
 from transformers import AutoModelForCausalLM, AutoTokenizer; \
 print(f'Downloading model: {model}'); \
-AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True); \
-AutoTokenizer.from_pretrained(model, trust_remote_code=True); \
+AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True, token=token); \
+AutoTokenizer.from_pretrained(model, trust_remote_code=True, token=token); \
 if tokenizer_name and tokenizer_name != model: \
     print(f'Downloading tokenizer: {tokenizer_name}'); \
-    AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True); \
+    AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True, token=token); \
 print('Cached')"
 
 COPY --chown=appuser:appuser environments/templar/cache_dataset.py /app/
