@@ -1,6 +1,6 @@
 {
     "netuid": 3,
-    "burn_rate": 0.95,
+    "burn_rate": 1.0,
     "burn_uid": 1,
 
     "evaluation_runs": 2,
