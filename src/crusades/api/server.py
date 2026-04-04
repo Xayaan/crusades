@@ -123,8 +123,33 @@ app = create_app()
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
+    """Health check endpoint with staleness detection.
+
+    Returns DB connectivity, last evaluation time, and queue depth
+    so external probes can detect a running-but-stale validator.
+    """
+    try:
+        client = get_db_client()
+        if client is None:
+            return {"status": "healthy", "db_connected": False}
+
+        validator_status = client.get_validator_status()
+        queue = client.get_queue_stats()
+
+        evaluations_1h = validator_status.get("evaluations_completed_1h", 0)
+        status = "healthy" if evaluations_1h > 0 else "degraded"
+
+        return {
+            "status": status,
+            "db_connected": True,
+            "evaluations_1h": evaluations_1h,
+            "queue_depth": queue.get("queued_count", 0),
+            "current_evaluation": validator_status.get("current_evaluation"),
+            "validator_status": validator_status.get("status", "unknown"),
+        }
+    except Exception:
+        logger.exception("Health check failed")
+        return {"status": "unhealthy", "db_connected": False}
 
 
 # ============================================================

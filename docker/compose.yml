@@ -100,3 +100,26 @@ services:
       # For private GitHub Container Registry
       - REPO_USER=${GITHUB_USER:-}
       - REPO_PASSWORD=${GITHUB_TOKEN:-}
+
+  # Health monitor - probes validator API and alerts via Discord
+  health-monitor:
+    image: python:3.12-slim
+    container_name: templar-crusades-health-monitor
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+    volumes:
+      - ../scripts:/app/scripts:ro
+
+    environment:
+      - VALIDATOR_URL=http://validator:8080
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
+      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-60}
+      - STALE_THRESHOLD_SECONDS=${STALE_THRESHOLD_SECONDS:-3600}
+
+    command: ["python", "/app/scripts/health_monitor.py"]
+
+    depends_on:
+      validator:
+        condition: service_started
