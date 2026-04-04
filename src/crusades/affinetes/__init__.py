@@ -6,6 +6,15 @@ URL-Based Architecture:
 - Supports docker (local) and basilica (remote) modes
 """
 
+from .executors import BasilicaExecutor, DockerExecutor, EvalConfig, ExecutorProtocol
 from .runner import AffinetesRunner, BasilicaDeploymentContext, EvaluationResult
 
-__all__ = ["AffinetesRunner", "BasilicaDeploymentContext", "EvaluationResult"]
+__all__ = [
+    "AffinetesRunner",
+    "BasilicaDeploymentContext",
+    "EvaluationResult",
+    "ExecutorProtocol",
+    "EvalConfig",
+    "DockerExecutor",
+    "BasilicaExecutor",
+]

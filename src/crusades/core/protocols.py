@@ -4,9 +4,15 @@ These protocols define contracts between components, enabling loose coupling
 and easy testing/mocking.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from crusades.storage.models import EvaluationModel, SubmissionModel
 
 
 class SubmissionStatus(StrEnum):
@@ -96,7 +102,7 @@ class SandboxRuntime(Protocol):
         code_path: str,
         timeout_seconds: int,
         env_vars: dict[str, str] | None = None,
-    ) -> "SandboxResult":
+    ) -> SandboxResult:
         """Run code in sandbox and return results."""
         ...
 
@@ -105,77 +111,59 @@ class SandboxRuntime(Protocol):
         ...
 
 
+@dataclass
 class SandboxResult:
     """Result from sandbox execution."""
 
-    def __init__(
-        self,
-        success: bool,
-        tokens_per_second: float,
-        total_tokens: int,
-        wall_time_seconds: float,
-        exit_code: int,
-        stdout: str,
-        stderr: str,
-        error: str | None = None,
-        # Verification fields
-        final_loss: float | None = None,
-        final_logits: Any = None,
-        final_logits_path: str | None = None,
-    ):
-        self.success = success
-        self.tokens_per_second = tokens_per_second
-        self.total_tokens = total_tokens
-        self.wall_time_seconds = wall_time_seconds
-        self.exit_code = exit_code
-        self.stdout = stdout
-        self.stderr = stderr
-        self.error = error
-        # Verification fields
-        self.final_loss = final_loss
-        self.final_logits = final_logits
-        self.final_logits_path = final_logits_path
+    success: bool
+    tokens_per_second: float
+    total_tokens: int
+    wall_time_seconds: float
+    exit_code: int
+    stdout: str
+    stderr: str
+    error: str | None = None
+    # Verification fields
+    final_loss: float | None = None
+    final_logits: Any = None
+    final_logits_path: str | None = None
 
 
 @runtime_checkable
 class CodeValidator(Protocol):
     """Protocol for code validation."""
 
-    def validate(self, code: str) -> "ValidationResult":
+    def validate(self, code: str) -> ValidationResult:
         """Validate code before execution."""
         ...
 
 
+@dataclass
 class ValidationResult:
     """Result from code validation."""
 
-    def __init__(
-        self,
-        valid: bool,
-        errors: list[str] | None = None,
-    ):
-        self.valid = valid
-        self.errors = errors or []
+    valid: bool
+    errors: list[str] = field(default_factory=list)
 
 
 @runtime_checkable
 class StorageBackend(Protocol):
     """Protocol for database operations."""
 
-    async def save_submission(self, submission: Any) -> None: ...
+    async def save_submission(self, submission: SubmissionModel) -> None: ...
 
-    async def get_submission(self, submission_id: str) -> Any | None: ...
+    async def get_submission(self, submission_id: str) -> SubmissionModel | None: ...
 
     async def update_submission_status(
         self, submission_id: str, status: SubmissionStatus
     ) -> None: ...
 
-    async def save_evaluation(self, evaluation: Any) -> None: ...
+    async def save_evaluation(self, evaluation: EvaluationModel) -> None: ...
 
-    async def get_evaluations(self, submission_id: str) -> list[Any]: ...
+    async def get_evaluations(self, submission_id: str) -> list[EvaluationModel]: ...
 
-    async def get_leaderboard(self, limit: int = 100) -> list[Any]: ...
+    async def get_leaderboard(self, limit: int = 100) -> list[SubmissionModel]: ...
 
-    async def get_top_submission(self) -> Any | None: ...
+    async def get_top_submission(self) -> SubmissionModel | None: ...
 
-    async def get_pending_submissions(self) -> list[Any]: ...
+    async def get_pending_submissions(self) -> list[SubmissionModel]: ...

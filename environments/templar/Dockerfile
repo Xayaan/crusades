@@ -39,6 +39,10 @@ os.environ['NUM_SAMPLES'] = str(cfg['benchmark_data_samples']); \
 exec(open('/app/cache_dataset.py').read())" || [ -f /home/appuser/.cache/templar/dataset.json ]
 
 COPY --chown=appuser:appuser environments/templar/env.py /app/
+COPY --chown=appuser:appuser environments/templar/model_loader.py /app/
+COPY --chown=appuser:appuser environments/templar/mfu.py /app/
+COPY --chown=appuser:appuser environments/templar/verifier.py /app/
+COPY --chown=appuser:appuser environments/templar/execution.py /app/
 
 # security_defs.py stub install (env.py imports crusades.core.security_defs)
 USER root

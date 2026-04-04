@@ -79,9 +79,29 @@ ignore = ["E501", "N812"]  # N812: Allow `import torch.nn.functional as F` (PyTo
 
 [tool.mypy]
 python_version = "3.12"
+strict = true
 warn_return_any = true
 warn_unused_configs = true
+
+# Third-party libraries without type stubs
+[[tool.mypy.overrides]]
+module = [
+    "bittensor.*",
+    "basilica.*",
+    "substrate_interface.*",
+    "substrateinterface.*",
+    "docker.*",
+    "datasets.*",
+    "transformers.*",
+    "accelerate.*",
+    "boto3.*",
+    "aiohttp.*",
+    "logging_loki.*",
+]
 ignore_missing_imports = true
+
+[tool.setuptools.package-data]
+crusades = ["py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
