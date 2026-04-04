@@ -28,14 +28,17 @@ import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from crusades import COMPETITION_VERSION
+from crusades.chain.burn_mode import BurnMode
+from crusades.storage.database import Database
 from crusades.tui.client import DatabaseClient, MockClient
 
 logger = logging.getLogger(__name__)
@@ -65,8 +68,17 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Crusades API starting...")
     get_db_client()
+
+    # Initialize async database for burn mode operations
+    db_path = os.getenv("CRUSADES_DB_PATH", "crusades.db")
+    db = Database(url=f"sqlite+aiosqlite:///{db_path}")
+    await db.initialize()
+    app.state.db = db
+
     yield
+
     # Shutdown
+    await db.close()
     global _db_client
     if _db_client:
         _db_client.close()
@@ -80,6 +92,65 @@ def verify_api_key(request: Request, x_api_key: str | None = Header(None)):
     if configured_key:
         if not x_api_key or not hmac.compare_digest(x_api_key, configured_key):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ============================================================
+# Burn Mode Router (defined before create_app so it can be included)
+# ============================================================
+
+
+class BurnModeActivateRequest(BaseModel):
+    """Request body for burn mode activation."""
+
+    burn_rate_override: float = Field(default=1.0, ge=0.0, le=1.0)
+    blocked_uids: list[int] = Field(default_factory=list)
+    reason: str = ""
+
+
+burn_mode_router = APIRouter(prefix="/burn-mode", tags=["burn-mode"])
+
+
+@burn_mode_router.post("/activate")
+async def activate_burn_mode(
+    request: Request,
+    body: BurnModeActivateRequest,
+) -> dict[str, Any]:
+    """Activate burn mode. Overrides hparams burn_rate and optionally blocks UIDs."""
+    db: Database = request.app.state.db
+    burn_mode = BurnMode(
+        enabled=True,
+        burn_rate_override=body.burn_rate_override,
+        blocked_uids=body.blocked_uids,
+        reason=body.reason,
+        activated_at=datetime.now(UTC),
+        activated_by="api",
+    )
+    await db.set_burn_mode(burn_mode)
+    logger.warning(
+        "Burn mode ACTIVATED: rate=%.0f%%, blocked=%s, reason=%s",
+        burn_mode.burn_rate_override * 100,
+        burn_mode.blocked_uids,
+        burn_mode.reason,
+    )
+    return burn_mode.model_dump(mode="json")
+
+
+@burn_mode_router.post("/deactivate")
+async def deactivate_burn_mode(request: Request) -> dict[str, Any]:
+    """Deactivate burn mode. Restores normal hparams-driven weight distribution."""
+    db: Database = request.app.state.db
+    burn_mode = BurnMode.inactive()
+    await db.set_burn_mode(burn_mode)
+    logger.warning("Burn mode DEACTIVATED")
+    return {"status": "deactivated"}
+
+
+@burn_mode_router.get("/status")
+async def get_burn_mode_status(request: Request) -> dict[str, Any]:
+    """Get current burn mode state."""
+    db: Database = request.app.state.db
+    burn_mode = await db.get_burn_mode()
+    return burn_mode.model_dump(mode="json")
 
 
 def create_app(api_key: str | None = None) -> FastAPI:
@@ -102,12 +173,15 @@ def create_app(api_key: str | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=["*"],  # In production, restrict to your domain
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
     # Store API key for authentication
     new_app.state.api_key = api_key or os.getenv("DASHBOARD_API_KEY")
+
+    # Include burn mode router
+    new_app.include_router(burn_mode_router)
 
     return new_app
 

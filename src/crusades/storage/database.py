@@ -6,6 +6,7 @@ from sqlalchemy import desc, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from ..chain.burn_mode import BURN_MODE_KEY, BurnMode
 from ..config import get_hparams
 from ..core.protocols import SubmissionStatus
 from .models import (
@@ -486,6 +487,19 @@ class Database:
                 )
             )
             return result.scalar_one_or_none()
+
+    # Burn mode operations
+
+    async def get_burn_mode(self) -> BurnMode:
+        """Load burn mode state from validator_state KV store."""
+        raw = await self.get_validator_state(BURN_MODE_KEY)
+        if raw is None:
+            return BurnMode.inactive()
+        return BurnMode.model_validate_json(raw)
+
+    async def set_burn_mode(self, burn_mode: BurnMode) -> None:
+        """Persist burn mode state to validator_state KV store."""
+        await self.set_validator_state(BURN_MODE_KEY, burn_mode.model_dump_json())
 
     # Adaptive threshold operations
 

@@ -76,6 +76,16 @@ class WeightSetter:
         Returns:
             Tuple of (success, message)
         """
+        # Load burn mode state — takes precedence over hparams burn_rate
+        burn_mode = await self.db.get_burn_mode()
+        if burn_mode.enabled:
+            logger.warning(
+                "Burn mode ACTIVE: rate_override=%.0f%%, blocked_uids=%s, reason=%s",
+                burn_mode.burn_rate_override * 100,
+                burn_mode.blocked_uids,
+                burn_mode.reason,
+            )
+
         # Sync metagraph to get latest state
         await self.chain.sync_metagraph()
 
@@ -200,12 +210,25 @@ class WeightSetter:
             self._previous_winner_score = winner_score
             await self._save_previous_winner(winner.submission_id, winner_score)
 
-        # Calculate weight distribution
-        winner_weight = 1.0 - self.burn_rate
-        burn_weight = self.burn_rate
+        # If burn mode is active and winner is blocked, redirect to burn
+        if burn_mode.enabled and winner_uid in burn_mode.blocked_uids:
+            logger.warning(
+                "Winner UID %d is blocked by burn mode — redirecting 100%% to burn_uid",
+                winner_uid,
+            )
+            return await self._set_burn_only_weights(
+                f"Winner UID {winner_uid} blocked by burn mode"
+            )
+
+        # Calculate weight distribution (burn mode overrides hparams burn_rate)
+        effective_burn_rate = (
+            burn_mode.burn_rate_override if burn_mode.enabled else self.burn_rate
+        )
+        winner_weight = 1.0 - effective_burn_rate
+        burn_weight = effective_burn_rate
 
         logger.info(
-            f"Setting weights with burn_rate={self.burn_rate:.0%}:\n"
+            f"Setting weights with burn_rate={effective_burn_rate:.0%}:\n"
             f"  - UID {self.burn_uid} (burn): {burn_weight:.2f}\n"
             f"  - UID {winner_uid} (winner, MFU={winner_score:.2f}%): {winner_weight:.2f}"
         )
