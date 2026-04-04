@@ -1,6 +1,6 @@
 """Templar Crusades - Training code efficiency crusades subnet."""
 
-__version__ = "0.19.0"
+__version__ = "0.19.1"
 
 # Competition version from major.minor version number
 # Major OR Minor bump = new competition (fresh start)
