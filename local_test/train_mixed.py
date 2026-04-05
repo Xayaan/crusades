@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
@@ -40,10 +41,6 @@ try:
     torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 except Exception:
     pass
-
-from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
-
-_flash_ce_inst = _FlashCELoss(ignore_index=-100)
 
 
 @dataclass
@@ -206,7 +203,6 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     _backbone = model.model
     _head = model.lm_head
-    _ce = _flash_ce_inst
 
     all_inputs = []
     all_labels = []
@@ -220,11 +216,33 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     torch.cuda.synchronize(device)
     total_tokens = num_steps * tokens_per_batch
 
+    # With dp=2 + tp=2, optimizer states + model + grads ≈ 62 GB.
+    # Full [B*S, 262K] logits add 8.6 GB → ~70+ GB peak, risky on 80 GB.
+    # Checkpoint the lm_head+CE per chunk so only chunk_h (~29 MB) is saved
+    # instead of chunk_logits (~2 GB), trading one extra matmul for ~8 GB savings.
+    chunk_size = 4096
+
+    def _chunk_ce(head, chunk_h, chunk_l):
+        logits = head(chunk_h)
+        return F.cross_entropy(logits, chunk_l, ignore_index=-100, reduction="sum")
+
     for step in range(num_steps):
         hidden = _backbone(all_inputs[step])[0]
-        logits = _head(hidden)
-        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
+        h_flat = hidden.reshape(-1, hidden.size(-1))
+        l_flat = all_labels[step].reshape(-1)
 
+        total_loss = torch.zeros(1, device=device)
+        n_valid = 0
+        for ci in range(0, h_flat.size(0), chunk_size):
+            ch = h_flat[ci : ci + _CHUNK]
+            cl = l_flat[ci : ci + _CHUNK]
+            n_tok = (cl != -100).sum().item()
+            if n_tok > 0:
+                chunk_loss = ckpt.checkpoint(_chunk_ce, _head, ch, cl, use_reentrant=False)
+                total_loss = total_loss + chunk_loss
+                n_valid += n_tok
+
+        loss = total_loss / max(n_valid, 1)
         loss.backward()
 
         if dp_pg is not None:
@@ -233,8 +251,12 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    final_logits = logits.detach()
     final_loss = loss.item()
+
+    with torch.no_grad():
+        final_hidden = _backbone(all_inputs[-1])[0]
+        final_logits = _head(final_hidden).detach()
+        del final_hidden
 
     if is_multi:
         rank = dist.get_rank() if dist.is_initialized() else 0

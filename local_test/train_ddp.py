@@ -1,22 +1,29 @@
-# High-MFU DDP strategy for 262K vocab (google/gemma-3-27b-it tokenizer)
+# High-MFU Data-Parallel strategy for 262K vocab (google/gemma-3-27b-it tokenizer)
 #
-# Topology: dp_size=4, tp_size=1, pp_size=1 (DDP across 4 GPUs)
+# Topology: dp_size=4, tp_size=1, pp_size=1
 #
-# DDP replicates the full model per GPU. With 262K vocab the resized model
-# is ~8.4B params, so memory is tight: micro-batching with gradient
-# accumulation keeps peak VRAM under 80 GB.
+# Uses FSDP with SHARD_GRAD_OP (ZeRO Stage 2) instead of vanilla DDP.
+# Vanilla DDP would OOM: model 17 GB + AdamW 67 GB + grads 17 GB = 101 GB > 80 GB.
+# SHARD_GRAD_OP keeps full parameters during forward (like DDP) but shards
+# gradients and optimizer states across GPUs: 17 + 17 + 4 = ~38 GB per GPU.
 #
 # Optimizations: torch.compile, flash_attn CE, Selective Activation
 # Checkpointing, bf16 logits (no fp32 upcast), pre-loaded batches,
 # inductor/dynamo tuning, TF32 matmul, fused AdamW.
 
 import functools
-from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.utils.checkpoint as ckpt
-from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: N817
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    MixedPrecision,
+    ShardingStrategy,
+)
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 try:
     from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
@@ -73,7 +80,6 @@ class InnerStepsResult:
 
 _PREPARED = set()
 _UNCHECKPOINT_LAST_N = 8
-MICRO_BATCH_SIZE = 1
 
 
 def _sac_policy(ctx, func, *args, **kwargs):
@@ -144,12 +150,32 @@ def _prepare_model(model):
         model.forward = _bf16_forward
 
 
+def _get_wrap_policy(model):
+    layer_cls = set()
+    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
+        layer_cls.add(type(model.model.layers[0]))
+    return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
+
+
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     _prepare_model(model)
-    model = model.to(dtype=torch.bfloat16)
 
-    if num_gpus > 1:
-        model = DDP(model, device_ids=[device.index])
+    bf16_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+
+    model = FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        auto_wrap_policy=_get_wrap_policy(model),
+        mixed_precision=bf16_policy,
+        device_id=device,
+        use_orig_params=True,
+        forward_prefetch=True,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+    )
 
     def fwd_fn(input_ids):
         return model(input_ids)
@@ -177,36 +203,31 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     torch.cuda.synchronize(device)
 
     total_tokens = num_steps * tokens_per_batch
+    opt_step = optimizer.step
+    opt_zero = optimizer.zero_grad
     _ce = _flash_ce_inst
 
     for step in range(num_steps):
-        inp = all_inputs[step]
-        lab = all_labels[step]
-        micro_batches_in = [
-            inp[i : i + MICRO_BATCH_SIZE] for i in range(0, inp.size(0), MICRO_BATCH_SIZE)
-        ]
-        micro_batches_lab = [
-            lab[i : i + MICRO_BATCH_SIZE] for i in range(0, lab.size(0), MICRO_BATCH_SIZE)
-        ]
-        num_accum = len(micro_batches_in)
-
-        for i in range(num_accum):
-            no_sync = hasattr(model, "no_sync") and i < num_accum - 1
-            ctx = model.no_sync() if no_sync else nullcontext()
-
-            with ctx:
-                logits = compiled_fwd(micro_batches_in[i])
-                loss = _ce(logits.reshape(-1, logits.size(-1)), micro_batches_lab[i].reshape(-1))
-                (loss / num_accum).backward()
-
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        logits = compiled_fwd(all_inputs[step])
+        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
+        loss.backward()
+        opt_step()
+        opt_zero(set_to_none=True)
 
     final_logits = logits.detach()
     final_loss = loss.item()
 
-    raw_model = model.module if hasattr(model, "module") else model
-    full_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    full_state = None
+    with FSDP.summon_full_params(model, writeback=False):
+        raw = model.module if hasattr(model, "module") else model
+        if rank == 0:
+            sd = raw.state_dict()
+            pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
+            for k, v in sd.items():
+                pinned[k].copy_(v, non_blocking=True)
+            torch.cuda.synchronize(device)
+            full_state = pinned
 
     return InnerStepsResult(
         final_logits=final_logits,
