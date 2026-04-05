@@ -1,31 +1,73 @@
-# Reference: Pipeline Parallelism (PP) strategy
+# High-MFU Pipeline Parallelism strategy for 262K vocab
 #
 # Topology: dp_size=2, tp_size=1, pp_size=2 (requires 4 GPUs)
 #   - 2 pipeline replicas, each with 2 stages
-#   - Ranks [0,1] form pipeline replica 0 (stage 0 on rank 0, stage 1 on rank 1)
-#   - Ranks [2,3] form pipeline replica 1 (stage 0 on rank 2, stage 1 on rank 3)
-#   - Different pipeline replicas get different data (data-parallel across DP dim)
-#   - Within a pipeline, stages share the same data and pass activations
+#   - Ranks [0,1] form pipeline 0; ranks [2,3] form pipeline 1
+#   - Different pipelines get different data (data-parallel across DP dim)
 #
-# Uses manual pipeline scheduling (no torch.distributed.pipelining dependency).
-# Each pipeline stage holds a contiguous slice of transformer layers.
-# Forward: stage 0 computes embeddings + first half of layers, sends activations.
-#          stage 1 receives activations, computes second half + lm_head, computes loss.
-# Backward: reverse order with gradient communication.
+# Manual 1F1B schedule: each stage holds half the transformer layers.
+# Stage 0: embed + first-half layers  →  send activations
+# Stage 1: recv activations  →  second-half layers + norm + lm_head  →  loss
+# Backward: reverse with gradient communication.
 #
-# Requirements for verification:
-#   - get_strategy() returning {"dp_size": 2, "tp_size": 1, "pp_size": 2}
-#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
-#   - Must return final_state: gathered full model state on rank 0
-#   - Rank 0 (first stage) must have valid 3-D logits and positive loss;
-#     the last stage sends these back after training since only rank 0
-#     is verified by the validator.
+# Under NCCL bandwidth throttling (NCCL_P2P_DISABLE=1), PP outperforms
+# FSDP/TP because it only sends activation tensors (~112 MB/step) instead
+# of all-reducing all gradients (~14 GB/step).
+#
+# Optimizations: torch.compile per stage, flash_attn CE (last stage),
+# Selective Activation Checkpointing, bf16, pre-loaded batches,
+# inductor/dynamo tuning, TF32 matmul, fused AdamW, lm_head graph break.
 
+import functools
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt
+
+try:
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
+
+    _HAS_SAC = True
+except ImportError:
+    _HAS_SAC = False
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+try:
+    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+except Exception:
+    pass
+
+try:
+    import torch._inductor.config as _ind_cfg
+
+    _ind_cfg.coordinate_descent_tuning = True
+    _ind_cfg.triton.unique_kernel_names = True
+    _ind_cfg.fx_graph_cache = True
+    _ind_cfg.triton.cudagraph_trees = True
+    _ind_cfg.epilogue_fusion = True
+    _ind_cfg.shape_padding = True
+except Exception:
+    pass
+
+try:
+    import torch._dynamo.config as _dyn_cfg
+
+    _dyn_cfg.cache_size_limit = 128
+    _dyn_cfg.suppress_errors = True
+    _dyn_cfg.assume_static_by_default = True
+    _dyn_cfg.automatic_dynamic_shapes = False
+except Exception:
+    pass
+
+from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
+
+_flash_ce_inst = _FlashCELoss(ignore_index=-100)
 
 
 @dataclass
@@ -33,7 +75,16 @@ class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
-    final_state: dict | None
+    final_state: dict | None = None
+
+
+_UNCHECKPOINT_LAST_N_PER_STAGE = 4
+
+
+def _sac_policy(ctx, func, *args, **kwargs):
+    if func in {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
 
 
 def get_strategy():
@@ -41,9 +92,7 @@ def get_strategy():
 
 
 def _split_model_layers(model):
-    """Split a HuggingFace causal LM into (embed + first half layers) and (second half layers + head)."""
-    layers = model.model.layers
-    n = len(layers)
+    n = len(model.model.layers)
     mid = n // 2
     return list(range(mid)), list(range(mid, n))
 
@@ -51,18 +100,20 @@ def _split_model_layers(model):
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if hasattr(model, "config"):
         model.config.use_cache = False
+        if hasattr(model.config, "output_hidden_states"):
+            model.config.output_hidden_states = False
+        if hasattr(model.config, "output_attentions"):
+            model.config.output_attentions = False
 
     strategy = get_strategy()
     pp_size = strategy["pp_size"]
     dp_size = strategy["dp_size"]
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    local_rank = int(__import__("os").environ.get("LOCAL_RANK", "0"))
-
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     pp_rank = local_rank % pp_size
     is_first_stage = pp_rank == 0
     is_last_stage = pp_rank == pp_size - 1
-
     pp_peer = local_rank + 1 if is_first_stage else local_rank - 1
 
     layer_indices_0, layer_indices_1 = _split_model_layers(model)
@@ -71,24 +122,75 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     all_layers = list(model.model.layers)
     n_layers = len(all_layers)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-
-    model = model.to(device)
+    model = model.to(device=device, dtype=torch.bfloat16)
 
     for i, layer in enumerate(all_layers):
         if i not in my_layer_indices:
             for p in layer.parameters():
                 p.requires_grad_(False)
-                p.data = p.data.to("meta") if hasattr(torch, "meta") else p.data.new_empty(0)
+                p.data = p.data.to("meta")
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    for idx in my_layer_indices:
+        layer = all_layers[idx]
+        if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+            layer.self_attn.layer_idx = 0
 
+    # --- Build compiled stage forward with SAC ---
+
+    def _make_layer_fn(layer):
+        def fn(h):
+            return layer(h)[0]
+
+        return fn
+
+    layer_fns = [_make_layer_fn(all_layers[i]) for i in my_layer_indices]
+
+    num_owned = len(my_layer_indices)
+    num_ckpt = max(0, num_owned - _UNCHECKPOINT_LAST_N_PER_STAGE)
+    _sac_ctx = (
+        functools.partial(create_selective_checkpoint_contexts, _sac_policy) if _HAS_SAC else None
+    )
+
+    if is_first_stage:
+        _embed = model.model.embed_tokens
+
+        def _stage_fwd(input_ids):
+            h = _embed(input_ids)
+            for i, fn in enumerate(layer_fns):
+                if _sac_ctx is not None and i < num_ckpt:
+                    h = ckpt.checkpoint(fn, h, use_reentrant=False, context_fn=_sac_ctx)
+                else:
+                    h = fn(h)
+            return h
+
+    else:
+        _norm = model.model.norm
+        _head = model.lm_head
+
+        @torch._dynamo.disable(recursive=False)
+        def _eager_lm_head(h):
+            return _head(h)
+
+        def _stage_fwd(hidden):
+            h = hidden
+            for i, fn in enumerate(layer_fns):
+                if _sac_ctx is not None and i < num_ckpt:
+                    h = ckpt.checkpoint(fn, h, use_reentrant=False, context_fn=_sac_ctx)
+                else:
+                    h = fn(h)
+            h = _norm(h)
+            return _eager_lm_head(h)
+
+    compiled_fwd = torch.compile(_stage_fwd, mode="default", dynamic=False)
+
+    # --- DP group, optimizer, pre-load ---
+
+    dp_group = None
     if dp_size > 1:
         dp_ranks = [r for r in range(num_gpus) if (r % pp_size) == pp_rank]
         dp_group = dist.new_group(dp_ranks)
-    else:
-        dp_group = None
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -96,29 +198,33 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             lr=1e-4,
             weight_decay=0.1,
             betas=(0.9, 0.95),
+            fused=True,
         )
 
-    hidden_size = model.config.hidden_size
+    all_inputs = []
+    all_labels = []
+    tokens_per_batch = 0
+    for _ in range(num_steps):
+        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
+        all_inputs.append(batch[:, :-1].contiguous())
+        all_labels.append(batch[:, 1:].contiguous())
+        tokens_per_batch = batch.numel()
 
-    total_tokens = 0
+    torch.cuda.synchronize(device)
+    total_tokens = num_steps * tokens_per_batch
+
+    hidden_size = model.config.hidden_size
+    _ce = _flash_ce_inst
     final_logits = None
     final_loss = 0.0
 
+    # --- Training loop ---
+
     for step in range(num_steps):
-        batch = next(data_iterator).to(device, dtype=torch.long)
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-        bs, seq_len = input_ids.shape
+        bs, seq_len = all_inputs[step].shape
 
         if is_first_stage:
-            hidden = model.model.embed_tokens(input_ids)
-
-            if hasattr(model.model, "rotary_emb"):
-                pass
-
-            for idx in my_layer_indices:
-                hidden = all_layers[idx](hidden)[0]
-
+            hidden = compiled_fwd(all_inputs[step])
             dist.send(hidden.detach().contiguous(), dst=pp_peer)
 
             recv_grad = torch.zeros_like(hidden)
@@ -126,27 +232,15 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             hidden.backward(recv_grad)
 
         else:
-            hidden = torch.zeros(bs, seq_len, hidden_size, device=device, dtype=torch.bfloat16)
-            hidden.requires_grad_(True)
-            dist.recv(hidden, src=pp_peer)
-            hidden = hidden.detach().requires_grad_(True)
+            recv_buf = torch.zeros(bs, seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+            dist.recv(recv_buf, src=pp_peer)
+            hidden = recv_buf.detach().requires_grad_(True)
 
-            h = hidden
-            for idx in my_layer_indices:
-                h = all_layers[idx](h)[0]
-
-            h = model.model.norm(h)
-            logits = model.lm_head(h)
-
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
-            )
+            logits = compiled_fwd(hidden)
+            loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
             loss.backward()
 
             dist.send(hidden.grad.contiguous(), dst=pp_peer)
-
             final_logits = logits.detach()
             final_loss = loss.item()
 
@@ -158,12 +252,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        total_tokens += batch.numel()
+    # --- Send logits & loss from last stage → first stage ---
 
-    # ── Send logits & loss from last stage → first stage ─────────────
-    # The validator only verifies rank 0's InnerStepsResult.  Rank 0 is
-    # the first pipeline stage and never computes loss/logits, so the
-    # last stage must send them back.
     if is_last_stage:
         if final_logits is None:
             final_logits = torch.zeros(1, device=device)
@@ -214,9 +304,7 @@ def _gather_pp_state(
         return my_state
 
     if is_first_stage:
-        keys_and_shapes = []
-        for k, v in my_state.items():
-            keys_and_shapes.append((k, v.shape, v.dtype))
+        keys_and_shapes = [(k, v.shape, v.dtype) for k, v in my_state.items()]
         obj_list = [keys_and_shapes]
         dist.broadcast_object_list(obj_list, src=dist.get_rank())
 
@@ -234,9 +322,7 @@ def _gather_pp_state(
         peer_obj = [None]
         dist.broadcast_object_list(peer_obj, src=pp_peer)
 
-        keys_and_shapes = []
-        for k, v in my_state.items():
-            keys_and_shapes.append((k, v.shape, v.dtype))
+        keys_and_shapes = [(k, v.shape, v.dtype) for k, v in my_state.items()]
         obj_list = [keys_and_shapes]
         dist.broadcast_object_list(obj_list, src=dist.get_rank())
 

@@ -1,25 +1,22 @@
-# Reference: Mixed DP+TP (Data Parallel + Tensor Parallel) strategy
+# High-MFU Mixed DP+TP strategy for 262K vocab
 #
 # Topology: dp_size=2, tp_size=2, pp_size=1 (requires 4 GPUs)
 #   - 2D mesh: ranks [0,1] form TP group 0, ranks [2,3] form TP group 1
 #   - Each TP group gets different data (data-parallel across DP dim)
 #   - Within each TP group, tensors are sharded (tensor-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": 2, "tp_size": 2, "pp_size": 1}
 #
-# Neither FSDP nor DDP can wrap TP's DTensor parameters (both try to
-# flatten/view params, which DTensor's sharding propagation rejects).
-# Instead we manually all-reduce gradients across the DP process group
-# after each backward pass.
+# Neither FSDP nor DDP can wrap TP's DTensor parameters.
+# Gradients are manually all-reduced across the DP process group.
 #
-# Requirements for verification:
-#   - get_strategy() returning {"dp_size": 2, "tp_size": 2, "pp_size": 1}
-#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
-#   - Must return final_state: gathered full tensors from DTensor shards
+# Optimizations: Selective Activation Checkpointing, bf16, pre-loaded
+# batches, flash_attn CE, TF32 matmul.
 
+import functools
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+import torch.utils.checkpoint as ckpt
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -27,13 +24,55 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
+try:
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
+
+    _HAS_SAC = True
+except ImportError:
+    _HAS_SAC = False
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+try:
+    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+except Exception:
+    pass
+
+from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
+
+_flash_ce_inst = _FlashCELoss(ignore_index=-100)
+
 
 @dataclass
 class InnerStepsResult:
     final_logits: torch.Tensor
     total_tokens: int
     final_loss: float
-    final_state: dict | None
+    final_state: dict | None = None
+
+
+_PREPARED = set()
+_UNCHECKPOINT_LAST_N = 8
+
+
+def _sac_policy(ctx, func, *args, **kwargs):
+    if func in {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+class _AllSAC:
+    def __init__(self, num_ckpt_layers):
+        self.num_ckpt_layers = num_ckpt_layers
+        self._count = 0
+
+    def __call__(self, fn, *args, **kwargs):
+        self._count += 1
+        ctx_fn = functools.partial(create_selective_checkpoint_contexts, _sac_policy)
+        return ckpt.checkpoint(fn, *args, use_reentrant=False, context_fn=ctx_fn, **kwargs)
 
 
 def get_strategy():
@@ -67,12 +106,7 @@ def _apply_tp(model, tp_mesh):
 
 
 def _allreduce_grads(model, dp_pg):
-    """Average gradients across DP group (replaces DDP/FSDP gradient sync).
-
-    TP converts parameters to DTensors; calling dist.all_reduce on a DTensor
-    triggers DTensor dispatch which fails without a matching DeviceMesh.
-    We operate on the underlying local tensor shard instead.
-    """
+    """Average gradients across DP group using underlying local tensor shard."""
     for param in model.parameters():
         if param.grad is not None:
             g = param.grad
@@ -103,40 +137,42 @@ def _gather_full_state(model):
     return state
 
 
-def _chunked_lm_loss(lm_head, hidden_states, labels, chunk_tokens=2048):
-    """Compute LM loss without materializing full [batch, seq, vocab] logits.
+def _prepare_model(model):
+    mid = id(model)
+    if mid in _PREPARED:
+        return
+    _PREPARED.add(mid)
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        if hasattr(model.config, "output_hidden_states"):
+            model.config.output_hidden_states = False
+        if hasattr(model.config, "output_attentions"):
+            model.config.output_attentions = False
 
-    Processes lm_head in chunks over the flattened sequence dimension so peak
-    memory is O(chunk_tokens * vocab) instead of O(batch * seq * vocab).
-    With 262K vocab, this saves ~4-8 GB VRAM.
-    """
-    _b, _s, h = hidden_states.shape
-    hidden_flat = hidden_states.reshape(-1, h)
-    labels_flat = labels.reshape(-1)
-    total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
-    n_valid = torch.tensor(0, device=hidden_states.device, dtype=torch.long)
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        num_layers = len(model.model.layers)
+        num_ckpt_layers = num_layers - _UNCHECKPOINT_LAST_N
 
-    for i in range(0, hidden_flat.size(0), chunk_tokens):
-        chunk_h = hidden_flat[i : i + chunk_tokens]
-        chunk_labels = labels_flat[i : i + chunk_tokens]
-        chunk_logits = lm_head(chunk_h)
-        mask = chunk_labels != -100
-        if mask.any():
-            total_loss = total_loss + torch.nn.functional.cross_entropy(
-                chunk_logits[mask], chunk_labels[mask], reduction="sum"
-            )
-            n_valid = n_valid + mask.sum()
-        del chunk_logits
-    return total_loss / n_valid.clamp(min=1)
+        for idx, layer in enumerate(model.model.layers):
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+                layer.self_attn.layer_idx = 0
+
+        if _HAS_SAC and num_ckpt_layers > 0:
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={
+                        "use_reentrant": False,
+                        "preserve_rng_state": False,
+                    }
+                )
+            for idx, layer in enumerate(model.model.layers):
+                if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
+                    layer.gradient_checkpointing = False
+            model.model._gradient_checkpointing_func = _AllSAC(num_ckpt_layers)
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    if hasattr(model, "config"):
-        model.config.use_cache = False
-
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-
+    _prepare_model(model)
     model = model.to(dtype=torch.bfloat16)
 
     strategy = get_strategy()
@@ -144,8 +180,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if num_gpus != expected_gpus:
         raise ValueError(
             f"get_strategy() requires {expected_gpus} GPUs "
-            f"(dp_size={strategy['dp_size']} * tp_size={strategy['tp_size']} "
-            f"* pp_size={strategy.get('pp_size', 1)}), "
+            f"(dp={strategy['dp_size']}*tp={strategy['tp_size']}*pp={strategy.get('pp_size', 1)}), "
             f"but num_gpus={num_gpus}"
         )
 
@@ -155,11 +190,9 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if is_multi:
         dp_size = strategy["dp_size"]
         tp_size = strategy["tp_size"]
-
         mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
         tp_mesh = mesh_2d["tp"]
         dp_pg = mesh_2d.get_group("dp")
-
         model = _apply_tp(model, tp_mesh)
 
     if optimizer is None:
@@ -171,19 +204,26 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             fused=False,
         )
 
-    lm_head = model.lm_head
+    _backbone = model.model
+    _head = model.lm_head
+    _ce = _flash_ce_inst
 
-    total_tokens = 0
-    final_logits = None
-    final_loss = 0.0
+    all_inputs = []
+    all_labels = []
+    tokens_per_batch = 0
+    for _ in range(num_steps):
+        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
+        all_inputs.append(batch[:, :-1].contiguous())
+        all_labels.append(batch[:, 1:].contiguous())
+        tokens_per_batch = batch.numel()
+
+    torch.cuda.synchronize(device)
+    total_tokens = num_steps * tokens_per_batch
 
     for step in range(num_steps):
-        batch = next(data_iterator).to(device, dtype=torch.long)
-        input_ids = batch[:, :-1]
-        labels = batch[:, 1:]
-
-        hidden_states = model.model(input_ids)[0]
-        loss = _chunked_lm_loss(lm_head, hidden_states, labels)
+        hidden = _backbone(all_inputs[step])[0]
+        logits = _head(hidden)
+        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
 
         loss.backward()
 
@@ -193,11 +233,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        total_tokens += batch.numel()
-        with torch.no_grad():
-            final_logits = lm_head(hidden_states).detach()
-        final_loss = loss.item()
-        del hidden_states
+    final_logits = logits.detach()
+    final_loss = loss.item()
 
     if is_multi:
         rank = dist.get_rank() if dist.is_initialized() else 0
