@@ -19,7 +19,6 @@
 # inductor/dynamo tuning, TF32 matmul, fused AdamW, lm_head graph break.
 
 import functools
-import os
 from dataclasses import dataclass
 
 import torch
@@ -27,7 +26,7 @@ import torch.distributed as dist
 import torch.utils.checkpoint as ckpt
 
 try:
-    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
     _HAS_SAC = True
 except ImportError:
@@ -110,7 +109,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     dp_size = strategy["dp_size"]
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    local_rank = device.index if device.index is not None else 0
     pp_rank = local_rank % pp_size
     is_first_stage = pp_rank == 0
     is_last_stage = pp_rank == pp_size - 1
