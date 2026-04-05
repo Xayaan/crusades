@@ -1,6 +1,6 @@
 {
     "netuid": 3,
-    "burn_rate": 0.95,
+    "burn_rate": 1.0,
     "burn_uid": 1,
 
     "evaluation_runs": 2,
@@ -40,9 +40,9 @@
     },
 
     "verification": {
-        "max_loss_difference": 0.3,
+        "max_loss_difference": 0.4,
         "min_params_changed_ratio": 0.75,
-        "weight_relative_error_max": 0.01,
+        "weight_relative_error_max": 0.015,
         "timer_divergence_threshold": 0.005
     },
 
