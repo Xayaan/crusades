@@ -50,6 +50,14 @@ def setup_model(model_name: str, output_dir: Path, tokenizer_name: str | None = 
     tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True, token=token)
     tokenizer.save_pretrained(output_dir)
 
+    # Also save to tokenizers/<name> for Docker build (Dockerfile COPYs this directory)
+    project_root = Path(__file__).parent.parent
+    docker_tok_dir = project_root / "tokenizers" / tok_source
+    if not docker_tok_dir.exists():
+        docker_tok_dir.mkdir(parents=True, exist_ok=True)
+        tokenizer.save_pretrained(docker_tok_dir)
+        print(f"   Tokenizer also saved to: {docker_tok_dir} (for Docker build)")
+
     print("   Downloading model (this may take a while)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
