@@ -15,12 +15,18 @@ Run once before testing your train.py locally:
 
 import itertools
 import json
+import os
 import sys
 from pathlib import Path
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _hf_token() -> str | None:
+    """Return HF token from env (needed for gated models like Gemma)."""
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -38,9 +44,10 @@ def setup_model(model_name: str, output_dir: Path, tokenizer_name: str | None = 
     print(f"Downloading model: {model_name}")
     print(f"   Output: {output_dir}")
 
+    token = _hf_token()
     tok_source = tokenizer_name or model_name
     print(f"   Downloading tokenizer ({tok_source})...")
-    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True, token=token)
     tokenizer.save_pretrained(output_dir)
 
     print("   Downloading model (this may take a while)...")
@@ -48,6 +55,7 @@ def setup_model(model_name: str, output_dir: Path, tokenizer_name: str | None = 
         model_name,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
+        token=token,
     )
 
     if tokenizer_name and tokenizer_name != model_name:
@@ -80,8 +88,9 @@ def setup_data(
     print(f"   Seed: {seed}")
     print(f"   Output: {output_path}")
 
+    token = _hf_token()
     print(f"   Loading tokenizer ({tok_source})...")
-    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True, token=token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
