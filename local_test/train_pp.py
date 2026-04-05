@@ -140,7 +140,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     def _make_layer_fn(layer):
         def fn(h, pos_emb):
-            return layer(h, position_embeddings=pos_emb)[0]
+            out = layer(h, position_embeddings=pos_emb)
+            return out[0] if isinstance(out, tuple) else out
 
         return fn
 
