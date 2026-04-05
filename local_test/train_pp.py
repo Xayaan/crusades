@@ -193,12 +193,20 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     compiled_fwd = torch.compile(_stage_fwd, mode="default", dynamic=False)
 
-    # --- DP group, optimizer, pre-load ---
+    # --- DP group, PP group, optimizer, pre-load ---
 
     dp_group = None
     if dp_size > 1:
         dp_ranks = [r for r in range(num_gpus) if (r % pp_size) == pp_rank]
         dp_group = dist.new_group(dp_ranks)
+
+    pp_group = None
+    if dist.is_initialized():
+        for start in range(0, num_gpus, pp_size):
+            members = list(range(start, start + pp_size))
+            g = dist.new_group(members)
+            if rank in members:
+                pp_group = g
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -279,7 +287,16 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         dist.recv(final_logits, src=pp_peer)
 
     full_state = _gather_pp_state(
-        model, all_layers, my_layer_indices, n_layers, pp_rank, pp_peer, is_first_stage, rank
+        model,
+        all_layers,
+        my_layer_indices,
+        n_layers,
+        pp_rank,
+        pp_peer,
+        is_first_stage,
+        rank,
+        device,
+        pp_group,
     )
 
     return InnerStepsResult(
@@ -291,50 +308,58 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
 
 def _gather_pp_state(
-    model, all_layers, my_layer_indices, n_layers, pp_rank, pp_peer, is_first_stage, global_rank
+    model,
+    all_layers,
+    my_layer_indices,
+    n_layers,
+    pp_rank,
+    pp_peer,
+    is_first_stage,
+    global_rank,
+    device,
+    pp_group,
 ):
     """Gather full model state dict across pipeline stages onto rank 0."""
     my_state = {}
 
     if is_first_stage:
         for k, v in model.model.embed_tokens.state_dict().items():
-            my_state[f"model.embed_tokens.{k}"] = v.detach().cpu().clone()
+            my_state[f"model.embed_tokens.{k}"] = v.detach().clone()
 
     for idx in my_layer_indices:
         for k, v in all_layers[idx].state_dict().items():
-            my_state[f"model.layers.{idx}.{k}"] = v.detach().cpu().clone()
+            my_state[f"model.layers.{idx}.{k}"] = v.detach().clone()
 
     if not is_first_stage:
         for k, v in model.model.norm.state_dict().items():
-            my_state[f"model.norm.{k}"] = v.detach().cpu().clone()
+            my_state[f"model.norm.{k}"] = v.detach().clone()
         for k, v in model.lm_head.state_dict().items():
-            my_state[f"lm_head.{k}"] = v.detach().cpu().clone()
+            my_state[f"lm_head.{k}"] = v.detach().clone()
 
     if not dist.is_initialized():
-        return my_state
+        return {k: v.cpu() for k, v in my_state.items()}
 
     if is_first_stage:
-        keys_and_shapes = [(k, v.shape, v.dtype) for k, v in my_state.items()]
-        obj_list = [keys_and_shapes]
-        dist.broadcast_object_list(obj_list, src=dist.get_rank())
+        obj_list = [[(k, v.shape, v.dtype) for k, v in my_state.items()]]
+        dist.broadcast_object_list(obj_list, src=global_rank, group=pp_group)
 
         peer_obj = [None]
-        dist.broadcast_object_list(peer_obj, src=pp_peer)
+        dist.broadcast_object_list(peer_obj, src=pp_peer, group=pp_group)
         peer_keys = peer_obj[0]
 
         for k, shape, dtype in peer_keys:
-            buf = torch.empty(shape, dtype=dtype)
+            buf = torch.empty(shape, dtype=dtype, device=device)
             dist.recv(buf, src=pp_peer)
             my_state[k] = buf
 
-        return my_state if global_rank == 0 else None
+        cpu_state = {k: v.cpu() for k, v in my_state.items()}
+        return cpu_state if global_rank == 0 else None
     else:
         peer_obj = [None]
-        dist.broadcast_object_list(peer_obj, src=pp_peer)
+        dist.broadcast_object_list(peer_obj, src=pp_peer, group=pp_group)
 
-        keys_and_shapes = [(k, v.shape, v.dtype) for k, v in my_state.items()]
-        obj_list = [keys_and_shapes]
-        dist.broadcast_object_list(obj_list, src=dist.get_rank())
+        obj_list = [[(k, v.shape, v.dtype) for k, v in my_state.items()]]
+        dist.broadcast_object_list(obj_list, src=global_rank, group=pp_group)
 
         for k, v in my_state.items():
             dist.send(v.contiguous(), dst=pp_peer)
