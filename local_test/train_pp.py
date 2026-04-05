@@ -136,9 +136,11 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     # --- Build compiled stage forward with SAC ---
 
+    _rotary_emb = model.model.rotary_emb if hasattr(model.model, "rotary_emb") else None
+
     def _make_layer_fn(layer):
-        def fn(h):
-            return layer(h)[0]
+        def fn(h, pos_emb):
+            return layer(h, position_embeddings=pos_emb)[0]
 
         return fn
 
@@ -150,16 +152,23 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         functools.partial(create_selective_checkpoint_contexts, _sac_policy) if _HAS_SAC else None
     )
 
+    def _compute_pos_emb(h):
+        if _rotary_emb is not None:
+            pos_ids = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
+            return _rotary_emb(h, pos_ids)
+        return None
+
     if is_first_stage:
         _embed = model.model.embed_tokens
 
         def _stage_fwd(input_ids):
             h = _embed(input_ids)
+            pos_emb = _compute_pos_emb(h)
             for i, fn in enumerate(layer_fns):
                 if _sac_ctx is not None and i < num_ckpt:
-                    h = ckpt.checkpoint(fn, h, use_reentrant=False, context_fn=_sac_ctx)
+                    h = ckpt.checkpoint(fn, h, pos_emb, use_reentrant=False, context_fn=_sac_ctx)
                 else:
-                    h = fn(h)
+                    h = fn(h, pos_emb)
             return h
 
     else:
@@ -172,11 +181,12 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
         def _stage_fwd(hidden):
             h = hidden
+            pos_emb = _compute_pos_emb(h)
             for i, fn in enumerate(layer_fns):
                 if _sac_ctx is not None and i < num_ckpt:
-                    h = ckpt.checkpoint(fn, h, use_reentrant=False, context_fn=_sac_ctx)
+                    h = ckpt.checkpoint(fn, h, pos_emb, use_reentrant=False, context_fn=_sac_ctx)
                 else:
-                    h = fn(h)
+                    h = fn(h, pos_emb)
             h = _norm(h)
             return _eager_lm_head(h)
 
