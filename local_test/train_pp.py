@@ -1,22 +1,20 @@
 # High-MFU Pipeline Parallelism strategy for 262K vocab
 #
-# Topology: dp_size=2, tp_size=1, pp_size=2 (requires 4 GPUs)
-#   - 2 pipeline replicas, each with 2 stages
-#   - Ranks [0,1] form pipeline 0; ranks [2,3] form pipeline 1
-#   - Different pipelines get different data (data-parallel across DP dim)
+# Topology: dp_size=1, tp_size=1, pp_size=4 (requires 4 GPUs)
+#   - Single 4-stage pipeline: rank 0 → rank 1 → rank 2 → rank 3
+#   - All ranks process the SAME data (dp=1, no data-parallel all-reduce)
 #
-# Manual 1F1B schedule: each stage holds half the transformer layers.
-# Stage 0: embed + first-half layers  →  send activations
-# Stage 1: recv activations  →  second-half layers + norm + lm_head  →  loss
-# Backward: reverse with gradient communication.
+# Key optimisation: M=16 microbatching with standard 1F1B schedule.
+#   Pipeline utilisation = M/(M+K-1) = 16/19 = 84.2%
 #
-# Under NCCL bandwidth throttling (NCCL_P2P_DISABLE=1), PP outperforms
-# FSDP/TP because it only sends activation tensors (~112 MB/step) instead
-# of all-reducing all gradients (~14 GB/step).
+# Under NCCL bandwidth throttling (P2P_DISABLE + MAX_NCHANNELS=1), PP
+# dominates FSDP/TP/DDP because it only sends tiny activation tensors
+# (~7 MB per micro) between adjacent stages.  There are ZERO collective
+# operations (no all-reduce, no all-gather) — only point-to-point sends.
 #
 # Optimizations: torch.compile per stage, flash_attn CE (last stage),
 # Selective Activation Checkpointing, bf16, pre-loaded batches,
-# inductor/dynamo tuning, TF32 matmul, fused AdamW, lm_head graph break.
+# inductor/dynamo tuning, TF32 matmul, fused AdamW.
 
 import functools
 from dataclasses import dataclass
@@ -68,6 +66,9 @@ from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
 
 _flash_ce_inst = _FlashCELoss(ignore_index=-100)
 
+_NUM_MICROBATCHES = 16
+_UNCHECKPOINT_LAST_N_PER_STAGE = 3
+
 
 @dataclass
 class InnerStepsResult:
@@ -77,9 +78,6 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 
-_UNCHECKPOINT_LAST_N_PER_STAGE = 4
-
-
 def _sac_policy(ctx, func, *args, **kwargs):
     if func in {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}:
         return CheckpointPolicy.MUST_SAVE
@@ -87,13 +85,21 @@ def _sac_policy(ctx, func, *args, **kwargs):
 
 
 def get_strategy():
-    return {"dp_size": 2, "tp_size": 1, "pp_size": 2}
+    return {"dp_size": 1, "tp_size": 1, "pp_size": 4}
 
 
-def _split_model_layers(model):
+def _split_model_layers(model, pp_size):
+    """Split layers evenly across pp_size stages."""
     n = len(model.model.layers)
-    mid = n // 2
-    return list(range(mid)), list(range(mid, n))
+    layers_per_stage = n // pp_size
+    remainder = n % pp_size
+    stages = []
+    start = 0
+    for s in range(pp_size):
+        count = layers_per_stage + (1 if s < remainder else 0)
+        stages.append(list(range(start, start + count)))
+        start += count
+    return stages
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -106,20 +112,19 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     strategy = get_strategy()
     pp_size = strategy["pp_size"]
-    dp_size = strategy["dp_size"]
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     local_rank = device.index if device.index is not None else 0
-    pp_rank = local_rank % pp_size
+    pp_rank = local_rank
     is_first_stage = pp_rank == 0
     is_last_stage = pp_rank == pp_size - 1
-    pp_peer = local_rank + 1 if is_first_stage else local_rank - 1
+    pp_prev = pp_rank - 1 if not is_first_stage else -1
+    pp_next = pp_rank + 1 if not is_last_stage else -1
 
-    layer_indices_0, layer_indices_1 = _split_model_layers(model)
-    my_layer_indices = layer_indices_0 if is_first_stage else layer_indices_1
+    all_stage_layers = _split_model_layers(model, pp_size)
+    my_layer_indices = all_stage_layers[pp_rank]
 
     all_layers = list(model.model.layers)
-    n_layers = len(all_layers)
 
     model = model.to(device=device, dtype=torch.bfloat16)
 
@@ -159,54 +164,39 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             return _rotary_emb(h, pos_ids)
         return None
 
+    def _run_layers(h):
+        pos_emb = _compute_pos_emb(h)
+        for i, fn in enumerate(layer_fns):
+            if _sac_ctx is not None and i < num_ckpt:
+                h = ckpt.checkpoint(fn, h, pos_emb, use_reentrant=False, context_fn=_sac_ctx)
+            else:
+                h = fn(h, pos_emb)
+        return h
+
     if is_first_stage:
         _embed = model.model.embed_tokens
 
         def _stage_fwd(input_ids):
             h = _embed(input_ids)
-            pos_emb = _compute_pos_emb(h)
-            for i, fn in enumerate(layer_fns):
-                if _sac_ctx is not None and i < num_ckpt:
-                    h = ckpt.checkpoint(fn, h, pos_emb, use_reentrant=False, context_fn=_sac_ctx)
-                else:
-                    h = fn(h, pos_emb)
-            return h
+            return _run_layers(h)
 
-    else:
+    elif is_last_stage:
         _norm = model.model.norm
         _head = model.lm_head
 
-        @torch._dynamo.disable(recursive=False)
-        def _eager_lm_head(h):
+        def _stage_fwd(hidden):
+            h = _run_layers(hidden)
+            h = _norm(h)
             return _head(h)
 
+    else:
+
         def _stage_fwd(hidden):
-            h = hidden
-            pos_emb = _compute_pos_emb(h)
-            for i, fn in enumerate(layer_fns):
-                if _sac_ctx is not None and i < num_ckpt:
-                    h = ckpt.checkpoint(fn, h, pos_emb, use_reentrant=False, context_fn=_sac_ctx)
-                else:
-                    h = fn(h, pos_emb)
-            h = _norm(h)
-            return _eager_lm_head(h)
+            return _run_layers(hidden)
 
     compiled_fwd = torch.compile(_stage_fwd, mode="default", dynamic=False)
 
-    # --- DP group, PP group, optimizer, pre-load ---
-
-    dp_group = None
-    if dp_size > 1:
-        dp_ranks = [r for r in range(num_gpus) if (r % pp_size) == pp_rank]
-        dp_group = dist.new_group(dp_ranks)
-
-    pp_group = None
-    if dist.is_initialized():
-        for start in range(0, num_gpus, pp_size):
-            members = list(range(start, start + pp_size))
-            g = dist.new_group(members)
-            if rank in members:
-                pp_group = g
+    # --- No DP groups needed (dp=1).  PP group is default world group. ---
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -219,53 +209,155 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             fused=True,
         )
 
-    all_inputs = []
-    all_labels = []
+    # --- Pre-load all batches and split into microbatches ---
+
+    all_micro_inputs = []
+    all_micro_labels = []
     tokens_per_batch = 0
+    hidden_size = model.config.hidden_size
+    n_microbatches = _NUM_MICROBATCHES
+
     for _ in range(num_steps):
         batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        all_inputs.append(batch[:, :-1].contiguous())
-        all_labels.append(batch[:, 1:].contiguous())
+        inp = batch[:, :-1].contiguous()
+        lab = batch[:, 1:].contiguous()
         tokens_per_batch = batch.numel()
+        bs = inp.shape[0]
+        micro_bs = max(1, bs // n_microbatches)
+        step_inputs = []
+        step_labels = []
+        for m in range(0, bs, micro_bs):
+            step_inputs.append(inp[m : m + micro_bs])
+            step_labels.append(lab[m : m + micro_bs])
+        all_micro_inputs.append(step_inputs)
+        all_micro_labels.append(step_labels)
 
     torch.cuda.synchronize(device)
     total_tokens = num_steps * tokens_per_batch
 
-    hidden_size = model.config.hidden_size
     _ce = _flash_ce_inst
     final_logits = None
     final_loss = 0.0
 
-    # --- Training loop ---
+    # 1F1B schedule parameters
+    num_warmup = pp_size - 1 - pp_rank
+
+    # --- Training loop with 1F1B schedule ---
 
     for step in range(num_steps):
-        bs, seq_len = all_inputs[step].shape
+        micro_inputs = all_micro_inputs[step]
+        micro_labels = all_micro_labels[step]
+        n_micro = len(micro_inputs)
+        total_micro_tokens = sum(ml.numel() for ml in micro_labels)
 
-        if is_first_stage:
-            hidden = compiled_fwd(all_inputs[step])
-            dist.send(hidden.detach().contiguous(), dst=pp_peer)
+        # saved_hidden[i]: data needed for backward of microbatch i
+        #   first stage: the output tensor h (has grad_fn)
+        #   middle stages: (input_hidden_with_grad, output_hidden_with_grad_fn)
+        #   last stage: None (backward is immediate)
+        saved = [None] * n_micro
 
-            recv_grad = torch.zeros_like(hidden)
-            dist.recv(recv_grad, src=pp_peer)
-            hidden.backward(recv_grad)
+        # isend handles for forward sends (non-blocking to avoid deadlock)
+        fwd_reqs = [None] * n_micro
 
-        else:
-            recv_buf = torch.zeros(bs, seq_len, hidden_size, device=device, dtype=torch.bfloat16)
-            dist.recv(recv_buf, src=pp_peer)
-            hidden = recv_buf.detach().requires_grad_(True)
+        step_loss = 0.0
+        last_logits = None
 
-            logits = compiled_fwd(hidden)
-            loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
-            loss.backward()
+        # ---- Helper: forward one microbatch ----
+        def _do_forward(mb_idx):
+            nonlocal step_loss, last_logits
 
-            dist.send(hidden.grad.contiguous(), dst=pp_peer)
-            final_logits = logits.detach()
-            final_loss = loss.item()
+            if is_first_stage:
+                h = compiled_fwd(micro_inputs[mb_idx])
+                saved[mb_idx] = h
+                buf = h.detach().contiguous()
+                fwd_reqs[mb_idx] = dist.isend(buf, dst=pp_next)
 
-        if dp_group is not None:
-            for p in trainable_params:
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=dp_group)
+            elif is_last_stage:
+                recv_buf = torch.zeros(
+                    micro_inputs[mb_idx].shape[0],
+                    micro_inputs[mb_idx].shape[1],
+                    hidden_size,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                dist.recv(recv_buf, src=pp_prev)
+                hidden_in = recv_buf.detach().requires_grad_(True)
+
+                logits = compiled_fwd(hidden_in)
+                micro_tokens = micro_labels[mb_idx].numel()
+                loss = _ce(
+                    logits.reshape(-1, logits.size(-1)),
+                    micro_labels[mb_idx].reshape(-1),
+                )
+                weight = micro_tokens / total_micro_tokens
+                scaled = loss * weight
+                scaled.backward()
+
+                dist.send(hidden_in.grad.contiguous(), dst=pp_prev)
+                step_loss += scaled.detach().item()
+
+                if mb_idx == n_micro - 1:
+                    last_logits = logits.detach()
+
+            else:
+                recv_buf = torch.zeros(
+                    micro_inputs[mb_idx].shape[0],
+                    micro_inputs[mb_idx].shape[1],
+                    hidden_size,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                dist.recv(recv_buf, src=pp_prev)
+                hidden_in = recv_buf.detach().requires_grad_(True)
+
+                h_out = compiled_fwd(hidden_in)
+                saved[mb_idx] = (hidden_in, h_out)
+                buf = h_out.detach().contiguous()
+                fwd_reqs[mb_idx] = dist.isend(buf, dst=pp_next)
+
+        # ---- Helper: backward one microbatch ----
+        def _do_backward(mb_idx):
+            if is_first_stage:
+                if fwd_reqs[mb_idx] is not None:
+                    fwd_reqs[mb_idx].wait()
+                grad_buf = torch.zeros_like(saved[mb_idx])
+                dist.recv(grad_buf, src=pp_next)
+                saved[mb_idx].backward(grad_buf)
+                saved[mb_idx] = None
+
+            elif is_last_stage:
+                pass  # backward already done in _do_forward
+
+            else:
+                if fwd_reqs[mb_idx] is not None:
+                    fwd_reqs[mb_idx].wait()
+                hidden_in, h_out = saved[mb_idx]
+                grad_buf = torch.zeros_like(h_out)
+                dist.recv(grad_buf, src=pp_next)
+                h_out.backward(grad_buf)
+                dist.send(hidden_in.grad.contiguous(), dst=pp_prev)
+                saved[mb_idx] = None
+
+        # ---- Phase 1: Warmup forwards ----
+        for i in range(num_warmup):
+            _do_forward(i)
+
+        # ---- Phase 2: Steady state (1 backward + 1 forward) ----
+        for i in range(num_warmup, n_micro):
+            bwd_idx = i - num_warmup
+            if not is_last_stage:
+                _do_backward(bwd_idx)
+            _do_forward(i)
+            if is_last_stage:
+                pass  # backward already happened inside _do_forward
+
+        # ---- Phase 3: Cooldown backwards ----
+        for i in range(n_micro - num_warmup, n_micro):
+            _do_backward(i)
+
+        if is_last_stage:
+            final_loss = step_loss
+            final_logits = last_logits
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -276,27 +368,35 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         if final_logits is None:
             final_logits = torch.zeros(1, device=device)
         loss_t = torch.tensor([final_loss], device=device, dtype=torch.float64)
-        dist.send(loss_t, dst=pp_peer)
-        dist.send(final_logits.contiguous(), dst=pp_peer)
+        dist.send(loss_t, dst=0)
+        dist.send(final_logits.contiguous(), dst=0)
     elif is_first_stage:
         vocab_size = model.config.vocab_size
         loss_t = torch.zeros(1, device=device, dtype=torch.float64)
-        dist.recv(loss_t, src=pp_peer)
+        dist.recv(loss_t, src=pp_size - 1)
         final_loss = loss_t.item()
-        final_logits = torch.zeros(bs, seq_len, vocab_size, device=device, dtype=torch.bfloat16)
-        dist.recv(final_logits, src=pp_peer)
+        micro_bs_last = all_micro_inputs[num_steps - 1][-1].shape[0]
+        seq_last = all_micro_inputs[num_steps - 1][-1].shape[1]
+        final_logits = torch.zeros(
+            micro_bs_last, seq_last, vocab_size, device=device, dtype=torch.bfloat16
+        )
+        dist.recv(final_logits, src=pp_size - 1)
+
+    # Middle stages need dummy logits/loss
+    if not is_first_stage and not is_last_stage:
+        final_logits = torch.zeros(1, device=device, dtype=torch.bfloat16)
+        final_loss = 0.0
 
     full_state = _gather_pp_state(
         model,
         all_layers,
         my_layer_indices,
-        n_layers,
         pp_rank,
-        pp_peer,
+        pp_size,
         is_first_stage,
+        is_last_stage,
         rank,
         device,
-        pp_group,
     )
 
     return InnerStepsResult(
@@ -311,15 +411,14 @@ def _gather_pp_state(
     model,
     all_layers,
     my_layer_indices,
-    n_layers,
     pp_rank,
-    pp_peer,
+    pp_size,
     is_first_stage,
+    is_last_stage,
     global_rank,
     device,
-    pp_group,
 ):
-    """Gather full model state dict across pipeline stages onto rank 0."""
+    """Gather full model state dict across all pipeline stages onto rank 0."""
     my_state = {}
 
     if is_first_stage:
@@ -330,7 +429,7 @@ def _gather_pp_state(
         for k, v in all_layers[idx].state_dict().items():
             my_state[f"model.layers.{idx}.{k}"] = v.detach().clone()
 
-    if not is_first_stage:
+    if is_last_stage:
         for k, v in model.model.norm.state_dict().items():
             my_state[f"model.norm.{k}"] = v.detach().clone()
         for k, v in model.lm_head.state_dict().items():
@@ -339,29 +438,27 @@ def _gather_pp_state(
     if not dist.is_initialized():
         return {k: v.cpu() for k, v in my_state.items()}
 
-    if is_first_stage:
-        obj_list = [[(k, v.shape, v.dtype) for k, v in my_state.items()]]
-        dist.broadcast_object_list(obj_list, src=global_rank, group=pp_group)
+    my_keys = [(k, v.shape, v.dtype) for k, v in my_state.items()]
 
-        peer_obj = [None]
-        dist.broadcast_object_list(peer_obj, src=pp_peer, group=pp_group)
-        peer_keys = peer_obj[0]
+    # All ranks participate in each broadcast (collective requirement)
+    all_keys = {}
+    for src in range(pp_size):
+        if src == global_rank:
+            obj = [my_keys]
+        else:
+            obj = [None]
+        dist.broadcast_object_list(obj, src=src)
+        all_keys[src] = obj[0]
 
-        for k, shape, dtype in peer_keys:
-            buf = torch.empty(shape, dtype=dtype, device=device)
-            dist.recv(buf, src=pp_peer)
-            my_state[k] = buf
-
-        cpu_state = {k: v.cpu() for k, v in my_state.items()}
-        return cpu_state if global_rank == 0 else None
+    if global_rank == 0:
+        full_state = dict(my_state)
+        for peer in range(1, pp_size):
+            for k, shape, dtype in all_keys[peer]:
+                buf = torch.empty(shape, dtype=dtype, device=device)
+                dist.recv(buf, src=peer)
+                full_state[k] = buf
+        return {k: v.cpu() for k, v in full_state.items()}
     else:
-        peer_obj = [None]
-        dist.broadcast_object_list(peer_obj, src=pp_peer, group=pp_group)
-
-        obj_list = [[(k, v.shape, v.dtype) for k, v in my_state.items()]]
-        dist.broadcast_object_list(obj_list, src=global_rank, group=pp_group)
-
         for k, v in my_state.items():
-            dist.send(v.contiguous(), dst=pp_peer)
-
+            dist.send(v.contiguous(), dst=0)
         return None

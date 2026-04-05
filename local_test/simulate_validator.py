@@ -11,17 +11,18 @@ same Docker container.
 2. Run the simulation (requires 4x A100 GPUs for 7B model):
 
     # Using GPUs 4,5,6,7 (adjust --gpus flag for your device IDs):
-    # NOTE: NCCL_P2P_DISABLE=1 throttles NVLink to simulate PCIe bandwidth,
-    #        incentivizing pipeline parallelism over collective-heavy strategies.
-    docker run --gpus '"device=4,5,6,7"' -it --rm \
+    # NOTE: NCCL throttling incentivizes pipeline parallelism by limiting
+    #        collective bandwidth (P2P disabled + single NCCL channel).
+    docker run --gpus '"device=0,1,2,3"' -it --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
         -e NCCL_P2P_DISABLE=1 \
         -e NCCL_NVLS_ENABLE=0 \
         -e NCCL_SHM_USE_CUDA_MEMCPY=0 \
         -e NCCL_IB_DISABLE=1 \
+        -e NCCL_MAX_NCHANNELS=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        -v "$(pwd)/local_test/train.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/train_pp.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
@@ -38,6 +39,7 @@ same Docker container.
         -e NCCL_NVLS_ENABLE=0 \
         -e NCCL_SHM_USE_CUDA_MEMCPY=0 \
         -e NCCL_IB_DISABLE=1 \
+        -e NCCL_MAX_NCHANNELS=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         -v "$(pwd)/local_test/train.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \

@@ -26,7 +26,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 try:
-    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
     _HAS_SAC = True
 except ImportError:
@@ -234,8 +234,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         total_loss = torch.zeros(1, device=device)
         n_valid = 0
         for ci in range(0, h_flat.size(0), chunk_size):
-            ch = h_flat[ci : ci + _CHUNK]
-            cl = l_flat[ci : ci + _CHUNK]
+            ch = h_flat[ci : ci + chunk_size]
+            cl = l_flat[ci : ci + chunk_size]
             n_tok = (cl != -100).sum().item()
             if n_tok > 0:
                 chunk_loss = ckpt.checkpoint(_chunk_ce, _head, ch, cl, use_reentrant=False)

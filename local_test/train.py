@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 from torch.distributed.fsdp import (
     BackwardPrefetch,
@@ -23,7 +22,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 try:
-    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
     _HAS_SAC = True
 except ImportError:
@@ -101,7 +100,7 @@ class _AllSAC:
 
 
 def get_strategy():
-    return {"dp_size": 2, "tp_size": 1, "pp_size": 2}
+    return {"dp_size": 4, "tp_size": 1, "pp_size": 1}
 
 
 def _prepare_model(model):

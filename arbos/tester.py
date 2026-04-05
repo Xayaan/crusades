@@ -540,6 +540,8 @@ class LocalDockerTester:
             "-e",
             "NCCL_IB_DISABLE=1",
             "-e",
+            "NCCL_MAX_NCHANNELS=1",
+            "-e",
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
             "-e",
             "PYTHONPATH=/app",

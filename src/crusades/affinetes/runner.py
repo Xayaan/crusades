@@ -661,10 +661,16 @@ asyncio.run(main())
             if self.num_gpus > 1:
                 docker_cmd.extend(
                     [
-                        "-e", "NCCL_P2P_DISABLE=1",
-                        "-e", "NCCL_NVLS_ENABLE=0",
-                        "-e", "NCCL_SHM_USE_CUDA_MEMCPY=0",
-                        "-e", "NCCL_IB_DISABLE=1",
+                        "-e",
+                        "NCCL_P2P_DISABLE=1",
+                        "-e",
+                        "NCCL_NVLS_ENABLE=0",
+                        "-e",
+                        "NCCL_SHM_USE_CUDA_MEMCPY=0",
+                        "-e",
+                        "NCCL_IB_DISABLE=1",
+                        "-e",
+                        "NCCL_MAX_NCHANNELS=1",
                     ]
                 )
 
