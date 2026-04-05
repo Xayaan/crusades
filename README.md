@@ -56,11 +56,14 @@ echo "HF_TOKEN=hf_your_token" > .env
 ### 1. Setup & Test Locally
 
 ```bash
-# Download model & data for local testing
+# Export your HuggingFace token (required for the Gemma tokenizer, which is gated)
+export HF_TOKEN=hf_your_token
+
+# Download model, tokenizer & data for local testing
 uv run local_test/setup_benchmark.py
 ```
 
-> **Hardware requirement:** The benchmark uses 2x A100 80 GB GPUs. The model (Qwen2.5-3B) fits on a single GPU, so DDP, FSDP, and TP strategies are all viable.
+> **Hardware requirement:** The benchmark uses **4x A100 80 GB SXM GPUs**. The model (Qwen2.5-7B with 262K Gemma tokenizer) requires memory-sharding strategies like FSDP or TP.
 
 ### Simulate the Validator (Recommended)
 
@@ -71,11 +74,11 @@ Test your `train.py` inside the **exact same Docker container** the production v
 docker build --network=host -f environments/templar/Dockerfile \
     --no-cache -t templar-eval:latest .
 
-# Run the simulation (requires 2x A100 GPUs)
+# Run the simulation (requires 4x A100 80GB GPUs)
 # Note: MFU/benchmark results will only closely match leaderboard numbers
-# when executed on the same GPU model (A100). Runs on other hardware may
+# when executed on the same GPU model (A100 SXM). Runs on other hardware may
 # produce divergent MFU results.
-docker run --gpus 2 -it --rm \
+docker run --gpus 4 -it --rm \
     --ipc=host \
     --ulimit memlock=-1:-1 \
     -e NCCL_P2P_LEVEL=NVL \
@@ -93,7 +96,7 @@ docker run --gpus 2 -it --rm \
     python3 /test/simulate.py
 ```
 
-Replace `train_fsdp.py` with `train_ddp.py`, `train_tp.py`, or `train_mixed.py` to test other strategies. `train_mixed.py` requires 4 GPUs (`dp_size=2, tp_size=2`).
+Replace `train_fsdp.py` with `train_ddp.py`, `train_tp.py`, `train_mixed.py`, or `train_pp.py` to test other strategies.
 
 This runs the full evaluation pipeline: security scan, reference baseline, warmup, timed eval, weight verification, and MFU calculation — all with the same thresholds as production.
 
@@ -134,7 +137,7 @@ See [docs/Validator.md](docs/Validator.md) for detailed validator setup.
 
 ## train.py Requirements
 
-You submit a **single `train.py` file**. The files in `local_test/` (`train_fsdp.py`, `train_tp.py`, `train_ddp.py`, `train_mixed.py`, `train.py`) are reference examples only — use them as a starting point for your own `train.py`.
+You submit a **single `train.py` file**. The files in `local_test/` (`train_fsdp.py`, `train_tp.py`, `train_ddp.py`, `train_mixed.py`, `train_pp.py`) are reference examples only — use them as a starting point for your own `train.py`.
 
 Your `train.py` must contain:
 1. **`inner_steps()`** — the training function (required)
@@ -146,22 +149,23 @@ For multi-GPU submissions, define this function to declare your parallelism topo
 
 ```python
 def get_strategy():
-    return {"dp_size": 2, "tp_size": 1}  # 2-way data parallel, no tensor parallel
+    return {"dp_size": 4, "tp_size": 1}  # 4-way FSDP across 4 GPUs
 ```
 
-The validator requires `dp_size * tp_size == num_gpus`. Common configurations:
+The validator requires `dp_size * tp_size * pp_size == num_gpus` (where `pp_size` defaults to 1). Common configurations for 4 GPUs:
 
 | Topology | Data Handling | Description |
 |----------|---------------|-------------|
-| `{"dp_size": N, "tp_size": 1}` | Sharded (each DP group gets different batches) | Pure data parallel (DDP/FSDP) |
-| `{"dp_size": 1, "tp_size": N}` | Replicated (all ranks get the same batches) | Pure tensor parallel |
-| `{"dp_size": D, "tp_size": T}` | Sharded across DP groups, replicated within TP groups | Mixed parallelism (e.g., FSDP+TP) |
+| `{"dp_size": 4, "tp_size": 1}` | Sharded (each DP group gets different batches) | Pure data parallel (DDP/FSDP) |
+| `{"dp_size": 1, "tp_size": 4}` | Replicated (all ranks get the same batches) | Pure tensor parallel |
+| `{"dp_size": 2, "tp_size": 2}` | Sharded across DP groups, replicated within TP groups | Mixed parallelism (FSDP+TP) |
+| `{"dp_size": 2, "tp_size": 1, "pp_size": 2}` | Sharded across DP groups, pipelined across PP stages | Pipeline parallelism + DP |
 
 Legacy string values (`"ddp"`, `"fsdp"`, `"tp"`) are still accepted but the dict format is preferred.
 
 **Important:** `get_strategy()` must return a literal value (string or dict). The validator parses this function via AST and only accepts direct `return` literals. Returning a computed value through a variable or helper function will be rejected even if the value itself is valid.
 
-This matters because the validator uses `dp_size` and `tp_size` to decide data distribution and MFU token counting. Declaring the wrong topology will cause weight verification failures.
+This matters because the validator uses `dp_size`, `tp_size`, and `pp_size` to decide data distribution and MFU token counting. Declaring the wrong topology will cause weight verification failures.
 
 ### `inner_steps()` Signature
 
@@ -204,7 +208,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStr
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 def get_strategy():
-    return {"dp_size": 2, "tp_size": 1}  # pure data parallel
+    return {"dp_size": 4, "tp_size": 1}  # 4-way FSDP
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     wrap_policy = functools.partial(
@@ -212,7 +216,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         transformer_layer_cls={type(model.model.layers[0])},
     )
     model = FSDP(model, sharding_strategy=ShardingStrategy.FULL_SHARD,
-                 auto_wrap_policy=wrap_policy, device_id=device.index)
+                 auto_wrap_policy=wrap_policy, device_id=device.index,
+                 use_orig_params=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
 
@@ -220,9 +225,9 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     # Return gathered final_state for weight verification
 ```
 
-See `local_test/train_fsdp.py`, `local_test/train_tp.py`, and `local_test/train_mixed.py` for complete working examples. The process group is already initialized by `torchrun` before `inner_steps` is called.
+See `local_test/train_fsdp.py`, `local_test/train_tp.py`, `local_test/train_mixed.py`, and `local_test/train_pp.py` for complete working examples. The process group is already initialized by `torchrun` before `inner_steps` is called.
 
-> **Note:** Single-GPU and DDP examples are kept in `local_test/` for reference but will OOM with the 7B model on A100 80 GB. Use FSDP or TP for the current benchmark.
+> **Note:** Single-GPU and DDP examples are kept in `local_test/` for reference but will OOM with the 7B model + 262K vocab on A100 80 GB. Use FSDP, TP, or PP for the current benchmark.
 
 ### Rules
 
@@ -250,11 +255,12 @@ Key settings in `hparams/hparams.json`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `netuid` | 3 | Subnet ID |
-| `evaluation_runs` | 3 | Runs per submission (median taken) |
-| `eval_steps` | 5 | Training steps per evaluation |
-| `benchmark_model_name` | Qwen/Qwen2.5-3B | Model for evaluation |
+| `evaluation_runs` | 2 | Runs per submission (median taken) |
+| `eval_steps` | 20 | Training steps per evaluation |
+| `benchmark_model_name` | Qwen/Qwen2.5-7B | Model for evaluation |
+| `benchmark_tokenizer_name` | google/gemma-3-27b-it | Tokenizer (262K vocab, requires HF_TOKEN) |
 | `benchmark_batch_size` | 16 | Batch size for evaluation |
-| `docker.num_gpus` | 2 | Number of GPUs (multi-GPU via `torchrun`) |
+| `docker.num_gpus` | 4 | Number of GPUs (multi-GPU via `torchrun`) |
 
 ---
 
