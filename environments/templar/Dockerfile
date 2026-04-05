@@ -56,6 +56,13 @@ COPY --chown=appuser:appuser src/crusades/core/security_defs.py /app/crusades/co
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# NCCL bandwidth throttling: disable P2P (NVLink) to simulate PCIe-like
+# interconnect, incentivizing pipeline parallelism over collective-heavy
+# strategies (FSDP full-shard, TP).
+ENV NCCL_P2P_DISABLE=1
+ENV NCCL_NVLS_ENABLE=0
+ENV NCCL_SHM_USE_CUDA_MEMCPY=0
+ENV NCCL_IB_DISABLE=1
 ENV PATH="/home/appuser/.local/bin:${PATH}"
 ENV CACHED_DATASET_PATH="/home/appuser/.cache/templar/dataset.json"
 ENV HF_HUB_OFFLINE=1

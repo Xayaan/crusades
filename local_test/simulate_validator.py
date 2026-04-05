@@ -11,12 +11,14 @@ same Docker container.
 2. Run the simulation (requires 4x A100 GPUs for 7B model):
 
     # Using GPUs 4,5,6,7 (adjust --gpus flag for your device IDs):
+    # NOTE: NCCL_P2P_DISABLE=1 throttles NVLink to simulate PCIe bandwidth,
+    #        incentivizing pipeline parallelism over collective-heavy strategies.
     docker run --gpus '"device=4,5,6,7"' -it --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
-        -e NCCL_P2P_LEVEL=NVL \
-        -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
-        -e NCCL_NVLS_ENABLE=1 \
+        -e NCCL_P2P_DISABLE=1 \
+        -e NCCL_NVLS_ENABLE=0 \
+        -e NCCL_SHM_USE_CUDA_MEMCPY=0 \
         -e NCCL_IB_DISABLE=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         -v "$(pwd)/local_test/train.py":/test/train.py:ro \
@@ -32,9 +34,9 @@ same Docker container.
     docker run --gpus 4 -it --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
-        -e NCCL_P2P_LEVEL=NVL \
-        -e NCCL_SHM_USE_CUDA_MEMCPY=1 \
-        -e NCCL_NVLS_ENABLE=1 \
+        -e NCCL_P2P_DISABLE=1 \
+        -e NCCL_NVLS_ENABLE=0 \
+        -e NCCL_SHM_USE_CUDA_MEMCPY=0 \
         -e NCCL_IB_DISABLE=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         -v "$(pwd)/local_test/train.py":/test/train.py:ro \

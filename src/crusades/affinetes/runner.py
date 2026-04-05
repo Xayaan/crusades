@@ -653,6 +653,21 @@ asyncio.run(main())
                 ]
             )
 
+            # NCCL bandwidth throttling: disable P2P (NVLink) and NVLink SHARP
+            # to simulate PCIe-like interconnect (~32 GB/s vs ~600 GB/s).
+            # This makes collective-heavy strategies (FSDP, TP) less efficient,
+            # incentivizing pipeline parallelism which only sends activations
+            # between stages.
+            if self.num_gpus > 1:
+                docker_cmd.extend(
+                    [
+                        "-e", "NCCL_P2P_DISABLE=1",
+                        "-e", "NCCL_NVLS_ENABLE=0",
+                        "-e", "NCCL_SHM_USE_CUDA_MEMCPY=0",
+                        "-e", "NCCL_IB_DISABLE=1",
+                    ]
+                )
+
             # Image and command
             if self.num_gpus > 1:
                 master_port = 29500 + secrets.randbelow(10001)
