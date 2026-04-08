@@ -8,10 +8,10 @@ same Docker container.
 
    docker build --network=host --no-cache -f environments/templar/Dockerfile -t templar-eval:latest .
 
-2. Run the simulation (requires 4x A100 GPUs for 7B model):
+2. Run the simulation (requires 4x A100 GPUs):
 
     # Using GPUs 4,5,6,7 (adjust --gpus flag for your device IDs):
-    docker run --gpus '"device=4,5,6,7"' -it --rm \
+    docker run --gpus '"device=4,5,6,7"' --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
         -e NCCL_P2P_LEVEL=NVL \
@@ -29,7 +29,7 @@ same Docker container.
         python3 /test/simulate.py
 
     # Using all GPUs (if only 4 available):
-    docker run --gpus 4 -it --rm \
+    docker run --gpus 4 --rm \
         --ipc=host \
         --ulimit memlock=-1:-1 \
         -e NCCL_P2P_LEVEL=NVL \
@@ -37,7 +37,7 @@ same Docker container.
         -e NCCL_NVLS_ENABLE=1 \
         -e NCCL_IB_DISABLE=1 \
         -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        -v "$(pwd)/local_test/train.py":/test/train.py:ro \
+        -v "$(pwd)/local_test/train_ep.py":/test/train.py:ro \
         -v "$(pwd)/local_test/simulate_validator.py":/test/simulate.py:ro \
         -v "$(pwd)/hparams/hparams.json":/app/hparams.json:ro \
         -v "$(pwd)/environments/templar/env.py":/app/env.py:ro \
@@ -46,11 +46,13 @@ same Docker container.
         templar-eval:latest \
         python3 /test/simulate.py
 
-   Strategies for 4 GPUs:
-   - train_mixed.py: dp_size=2, tp_size=2 (mixed DP+TP)
-   - train_ddp.py:   dp_size=4, tp_size=1 (4-way DDP) — update get_strategy()
-   - train_fsdp.py:  dp_size=4, tp_size=1 (4-way FSDP) — update get_strategy()
-   - train_tp.py:    dp_size=1, tp_size=4 (4-way TP) — update get_strategy()
+   Strategies for 4 GPUs (Qwen3-30B-A3B MoE):
+   - train.py:       dp_size=4, tp_size=1, ep_size=1 (4-way FSDP, recommended)
+   - train_ep.py:    dp_size=1, tp_size=1, ep_size=4 (4-way Expert Parallel)
+   - train_fsdp.py:  dp_size=4, tp_size=1, ep_size=1 (4-way FSDP, alternate)
+   - train_mixed.py: dp_size=2, tp_size=2, ep_size=1 (mixed DP+TP)
+   - train_ddp.py:   dp_size=4, tp_size=1, ep_size=1 (4-way DDP — likely OOM)
+   - train_tp.py:    dp_size=1, tp_size=4, ep_size=1 (4-way TP)
 """
 
 import asyncio
@@ -62,7 +64,6 @@ sys.path.append("/app")
 
 
 def _sanitize(obj):
-    """Make diagnostics JSON-serializable (handles tensors etc.)."""
     if isinstance(obj, dict):
         return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -131,7 +132,6 @@ def _print_result(result):
 
 
 async def _simulate_single_gpu(payload):
-    """Direct Actor call — single process, no torchrun needed."""
     from env import Actor
 
     actor = Actor()
@@ -161,7 +161,6 @@ async def _simulate_single_gpu(payload):
 
 
 async def _simulate_multi_gpu(payload):
-    """Spawn torchrun and stream output so logs are visible (warmup, timing, etc.)."""
     import tempfile
 
     num_gpus = payload["num_gpus"]

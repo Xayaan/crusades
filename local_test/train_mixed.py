@@ -1,21 +1,3 @@
-# Reference: Mixed DP+TP (Data Parallel + Tensor Parallel) strategy
-#
-# Topology: dp_size=2, tp_size=2 (requires 4 GPUs)
-#   - 2D mesh: ranks [0,1] form TP group 0, ranks [2,3] form TP group 1
-#   - Each TP group gets different data (data-parallel across DP dim)
-#   - Within each TP group, tensors are sharded (tensor-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": 2, "tp_size": 2}
-#
-# Neither FSDP nor DDP can wrap TP's DTensor parameters (both try to
-# flatten/view params, which DTensor's sharding propagation rejects).
-# Instead we manually all-reduce gradients across the DP process group
-# after each backward pass.
-#
-# Requirements for verification:
-#   - get_strategy() returning {"dp_size": 2, "tp_size": 2}
-#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
-#   - Must return final_state: gathered full tensors from DTensor shards
-
 from dataclasses import dataclass
 
 import torch
@@ -37,7 +19,7 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return {"dp_size": 2, "tp_size": 2}
+    return {"dp_size": 2, "tp_size": 2, "ep_size": 1}
 
 
 def _apply_tp(model, tp_mesh):
@@ -67,12 +49,6 @@ def _apply_tp(model, tp_mesh):
 
 
 def _allreduce_grads(model, dp_pg):
-    """Average gradients across DP group (replaces DDP/FSDP gradient sync).
-
-    TP converts parameters to DTensors; calling dist.all_reduce on a DTensor
-    triggers DTensor dispatch which fails without a matching DeviceMesh.
-    We operate on the underlying local tensor shard instead.
-    """
     for param in model.parameters():
         if param.grad is not None:
             g = param.grad
@@ -81,7 +57,6 @@ def _allreduce_grads(model, dp_pg):
 
 
 def _gather_full_state(model):
-    """Gather full tensors from DTensor shards (collective op, all ranks must call)."""
     state = {}
     for name, param in model.named_parameters():
         p = param.data
@@ -104,12 +79,6 @@ def _gather_full_state(model):
 
 
 def _chunked_lm_loss(lm_head, hidden_states, labels, chunk_tokens=2048):
-    """Compute LM loss without materializing full [batch, seq, vocab] logits.
-
-    Processes lm_head in chunks over the flattened sequence dimension so peak
-    memory is O(chunk_tokens * vocab) instead of O(batch * seq * vocab).
-    With 262K vocab, this saves ~4-8 GB VRAM.
-    """
     _b, _s, h = hidden_states.shape
     hidden_flat = hidden_states.reshape(-1, h)
     labels_flat = labels.reshape(-1)
@@ -135,7 +104,12 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model.config.use_cache = False
 
     if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "preserve_rng_state": False,
+            }
+        )
 
     model = model.to(dtype=torch.bfloat16)
 
@@ -162,12 +136,11 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model = _apply_tp(model, tp_mesh)
 
     if optimizer is None:
-        optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.SGD(
             model.parameters(),
-            lr=1e-4,
+            lr=0.1,
             weight_decay=0.1,
-            betas=(0.9, 0.95),
-            fused=False,
+            momentum=0.0,
         )
 
     lm_head = model.lm_head

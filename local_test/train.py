@@ -1,34 +1,17 @@
-# High-MFU FSDP strategy for 262K vocab (google/gemma-3-27b-it tokenizer)
-#
-# Adapted from the 151K-vocab version that achieved ~75% MFU.
-# Key change: bypasses HuggingFace's .float() upcast on logits, keeping them
-# in bf16 to avoid the 17 GB fp32 logits tensor (262K * B*S * 4).  In bf16
-# the logits cost ~8.6 GB — comparable to the 151K fp32 case (~10 GB).
-#
-# Topology: dp_size=4, tp_size=1  (FSDP FULL_SHARD across 4 GPUs)
-
 import functools
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     MixedPrecision,
     ShardingStrategy,
 )
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-
-try:
-    from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
-
-    _HAS_SAC = True
-except ImportError:
-    _HAS_SAC = False
-
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -39,33 +22,6 @@ try:
 except Exception:
     pass
 
-try:
-    import torch._inductor.config as _ind_cfg
-
-    _ind_cfg.coordinate_descent_tuning = True
-    _ind_cfg.triton.unique_kernel_names = True
-    _ind_cfg.fx_graph_cache = True
-    _ind_cfg.triton.cudagraph_trees = True
-    _ind_cfg.epilogue_fusion = True
-    _ind_cfg.shape_padding = True
-except Exception:
-    pass
-
-try:
-    import torch._dynamo.config as _dyn_cfg
-
-    _dyn_cfg.cache_size_limit = 128
-    _dyn_cfg.suppress_errors = True
-    _dyn_cfg.assume_static_by_default = True
-    _dyn_cfg.automatic_dynamic_shapes = False
-    _dyn_cfg.optimize_ddp = True
-except Exception:
-    pass
-
-from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
-
-_flash_ce_inst = _FlashCELoss(ignore_index=-100)
-
 
 @dataclass
 class InnerStepsResult:
@@ -75,90 +31,11 @@ class InnerStepsResult:
     final_state: dict | None = None
 
 
-_PREPARED = set()
-
-# 262K vocab needs more activation-memory headroom than 151K.
-# Checkpoint 20 of 28 layers (SAC), leave 8 un-checkpointed for throughput.
-# MFU cost vs _UNCHECKPOINT_LAST_N=16: ~2-3 pp (SAC only recomputes non-mm ops).
-_UNCHECKPOINT_LAST_N = 8
-
-
-def _sac_policy(ctx, func, *args, **kwargs):
-    if func in {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}:
-        return CheckpointPolicy.MUST_SAVE
-    return CheckpointPolicy.PREFER_RECOMPUTE
-
-
-class _AllSAC:
-    def __init__(self, num_ckpt_layers):
-        self.num_ckpt_layers = num_ckpt_layers
-        self._count = 0
-
-    def __call__(self, fn, *args, **kwargs):
-        self._count += 1
-        ctx_fn = functools.partial(create_selective_checkpoint_contexts, _sac_policy)
-        return ckpt.checkpoint(fn, *args, use_reentrant=False, context_fn=ctx_fn, **kwargs)
-
-
 def get_strategy():
-    return {"dp_size": 4, "tp_size": 1}
+    return {"dp_size": 4, "tp_size": 1, "ep_size": 1}
 
 
-def _prepare_model(model):
-    mid = id(model)
-    if mid in _PREPARED:
-        return
-    _PREPARED.add(mid)
-    if hasattr(model, "config"):
-        model.config.use_cache = False
-        if hasattr(model.config, "output_hidden_states"):
-            model.config.output_hidden_states = False
-        if hasattr(model.config, "output_attentions"):
-            model.config.output_attentions = False
-
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        num_layers = len(model.model.layers)
-        num_ckpt_layers = num_layers - _UNCHECKPOINT_LAST_N
-
-        for idx, layer in enumerate(model.model.layers):
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
-                layer.self_attn.layer_idx = 0
-            if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
-                layer.gradient_checkpointing = False
-
-        if _HAS_SAC and num_ckpt_layers > 0:
-            if hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={
-                        "use_reentrant": False,
-                        "preserve_rng_state": False,
-                    }
-                )
-            for idx, layer in enumerate(model.model.layers):
-                if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
-                    layer.gradient_checkpointing = False
-            model.model._gradient_checkpointing_func = _AllSAC(num_ckpt_layers)
-
-    # HuggingFace CausalLM models upcast logits to fp32 inside forward().
-    # With 262K vocab @ B=16, S=1024 that wastes ~8.6 GB per GPU.
-    # Staying in bf16 keeps peak memory comparable to the 151K fp32 case.
-    #
-    # lm_head is wrapped with @torch._dynamo.disable so that torch.compile
-    # creates a graph break right before it.  The backbone is compiled
-    # (standard FSDP+compile path); the lm_head runs eagerly so the
-    # inductor never allocates the [B*S, V] backward buffer (~8 GB).
-    if hasattr(model, "lm_head") and hasattr(model, "model"):
-        _backbone = model.model
-        _head = model.lm_head
-
-        @torch._dynamo.disable(recursive=False)
-        def _eager_lm_head(hidden):
-            return _head(hidden)
-
-        def _bf16_forward(input_ids, **kwargs):
-            return _eager_lm_head(_backbone(input_ids)[0])
-
-        model.forward = _bf16_forward
+MICRO_BATCH_SIZE = 1
 
 
 def _get_wrap_policy(model):
@@ -166,6 +43,25 @@ def _get_wrap_policy(model):
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
         layer_cls.add(type(model.model.layers[0]))
     return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
+
+
+def _prepare_model(model):
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        if hasattr(model.config, "output_hidden_states"):
+            model.config.output_hidden_states = False
+        if hasattr(model.config, "output_attentions"):
+            model.config.output_attentions = False
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "preserve_rng_state": False,
+            }
+        )
+
+    return model
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -188,45 +84,50 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
     )
 
-    def fwd_fn(input_ids):
-        return model(input_ids)
-
-    compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
-
     if optimizer is None:
-        optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.SGD(
             model.parameters(),
-            lr=1e-4,
+            lr=0.1,
             weight_decay=0.1,
-            betas=(0.9, 0.95),
-            fused=True,
+            momentum=0.0,
         )
 
-    all_inputs = []
-    all_labels = []
-    tokens_per_batch = 0
-    for _ in range(num_steps):
-        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        all_inputs.append(batch[:, :-1].contiguous())
-        all_labels.append(batch[:, 1:].contiguous())
-        tokens_per_batch = batch.numel()
-
-    torch.cuda.synchronize(device)
-
-    total_tokens = num_steps * tokens_per_batch
-    opt_step = optimizer.step
-    opt_zero = optimizer.zero_grad
-    _ce = _flash_ce_inst
+    total_tokens = 0
+    final_logits = None
+    final_loss = 0.0
 
     for step in range(num_steps):
-        logits = compiled_fwd(all_inputs[step])
-        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
-        loss.backward()
-        opt_step()
-        opt_zero(set_to_none=True)
+        batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
+        micro_batches = [
+            batch[i : i + MICRO_BATCH_SIZE] for i in range(0, batch.size(0), MICRO_BATCH_SIZE)
+        ]
+        num_accum = len(micro_batches)
+        step_loss_sum = 0.0
 
-    final_logits = logits.detach()
-    final_loss = loss.item()
+        for idx, mb in enumerate(micro_batches):
+            input_ids = mb[:, :-1].contiguous()
+            labels = mb[:, 1:].contiguous()
+
+            sync_ctx = model.no_sync() if idx < num_accum - 1 else nullcontext()
+            with sync_ctx:
+                outputs = model(input_ids)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
+                (loss / num_accum).backward()
+
+            step_loss_sum += loss.item()
+            if idx == num_accum - 1:
+                final_logits = logits.detach()
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        total_tokens += batch.numel()
+        final_loss = step_loss_sum / num_accum
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     full_state = None

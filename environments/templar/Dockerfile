@@ -25,11 +25,13 @@ RUN python -c "\
 import json; \
 cfg = json.load(open('/app/hparams.json')); \
 model = cfg['benchmark_model_name']; \
+tok = cfg.get('benchmark_tokenizer_name') or model; \
 from transformers import AutoModelForCausalLM, AutoTokenizer; \
 print(f'Downloading model: {model}'); \
 AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True); \
-AutoTokenizer.from_pretrained(model, trust_remote_code=True); \
-print('Model cached')"
+print(f'Downloading tokenizer: {tok}'); \
+AutoTokenizer.from_pretrained(tok, trust_remote_code=True); \
+print('Model + tokenizer cached')"
 
 COPY --chown=appuser:appuser environments/templar/cache_dataset.py /app/
 RUN python -c "\

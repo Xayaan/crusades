@@ -1,19 +1,3 @@
-# Reference: TP (Tensor Parallel) strategy
-#
-# Topology: dp_size=1, tp_size=num_gpus
-#   - All ranks receive the same data (NOT data-parallel)
-#   - Equivalent to: get_strategy() -> {"dp_size": 1, "tp_size": num_gpus}
-#
-# TP shards attention Q/K/V/O and MLP gate/up/down across GPUs.
-# Embeddings and lm_head remain unsharded.  With gradient checkpointing
-# and chunked lm_head loss, fits on 4x A100 80 GB even with 262K vocab.
-#
-# Requirements for verification:
-#   - get_strategy() returning "tp" or {"dp_size": 1, "tp_size": N}
-#   - Return InnerStepsResult with final_logits, total_tokens, final_loss
-#   - Must return final_state: gathered full tensors from DTensor shards
-#     TP replaces params with DTensors so validator cannot read weights directly
-
 from dataclasses import dataclass
 
 import torch
@@ -34,7 +18,7 @@ class InnerStepsResult:
 
 
 def get_strategy():
-    return {"dp_size": 1, "tp_size": 4}
+    return {"dp_size": 1, "tp_size": 4, "ep_size": 1}
 
 
 def _apply_tp(model, device_mesh):
@@ -64,7 +48,6 @@ def _apply_tp(model, device_mesh):
 
 
 def _gather_full_state(model):
-    """Gather full tensors from DTensor shards (collective op, all ranks must call)."""
     state = {}
     for name, param in model.named_parameters():
         p = param.data
@@ -87,12 +70,6 @@ def _gather_full_state(model):
 
 
 def _chunked_lm_loss(lm_head, hidden_states, labels, chunk_tokens=2048):
-    """Compute LM loss without materializing full [batch, seq, vocab] logits.
-
-    Processes lm_head in chunks over the flattened sequence dimension so peak
-    memory is O(chunk_tokens * vocab) instead of O(batch * seq * vocab).
-    With 262K vocab, this saves ~4-8 GB VRAM.
-    """
     _b, _s, h = hidden_states.shape
     hidden_flat = hidden_states.reshape(-1, h)
     labels_flat = labels.reshape(-1)
@@ -118,7 +95,12 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model.config.use_cache = False
 
     if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "preserve_rng_state": False,
+            }
+        )
 
     model = model.to(dtype=torch.bfloat16)
 
@@ -128,12 +110,11 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         model = _apply_tp(model, mesh)
 
     if optimizer is None:
-        optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.SGD(
             model.parameters(),
-            lr=1e-4,
+            lr=0.1,
             weight_decay=0.1,
-            betas=(0.9, 0.95),
-            fused=not is_tp,
+            momentum=0.0,
         )
 
     lm_head = model.lm_head

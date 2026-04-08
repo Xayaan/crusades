@@ -201,6 +201,7 @@ class ParallelismConfig:
 
     dp_size: int
     tp_size: int
+    ep_size: int = 1
 
 
 def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismConfig | None:
@@ -236,7 +237,7 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
                         return ParallelismConfig(dp_size=num_gpus, tp_size=1)
                     return ParallelismConfig(dp_size=1, tp_size=num_gpus)
 
-            # Dict literal format: {"dp_size": int, "tp_size": int}
+            # Dict literal format: {"dp_size": int, "tp_size": int, "ep_size": int}
             if isinstance(stmt.value, ast.Dict):
                 d: dict[str, int] = {}
                 for k, v in zip(stmt.value.keys, stmt.value.values):
@@ -250,8 +251,9 @@ def _detect_strategy_from_source(source: str, num_gpus: int = 1) -> ParallelismC
                 if "dp_size" in d and "tp_size" in d:
                     dp = d["dp_size"]
                     tp = d["tp_size"]
-                    if dp >= 1 and tp >= 1:
-                        return ParallelismConfig(dp_size=dp, tp_size=tp)
+                    ep = d.get("ep_size", 1)
+                    if dp >= 1 and tp >= 1 and ep >= 1:
+                        return ParallelismConfig(dp_size=dp, tp_size=tp, ep_size=ep)
 
     return None
 
@@ -1203,14 +1205,14 @@ def _load_model(model_path: str, use_random_init: bool = False):
 
         device = f"cuda:{_LOCAL_RANK}" if torch.cuda.is_available() else "cpu"
         attn_impl = "flash_attention_2" if torch.cuda.is_available() else "eager"
-        model = AutoModelForCausalLM.from_config(
-            config,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation=attn_impl,
-        )
-        model = model.to(device)
-        logger.info(f"Model loaded on {device} (rank {_LOCAL_RANK})")
+        with torch.device(device):
+            model = AutoModelForCausalLM.from_config(
+                config,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                attn_implementation=attn_impl,
+            )
+        logger.info(f"Model created directly on {device} (rank {_LOCAL_RANK})")
     else:
         logger.info(f"Loading pretrained model from {model_path}")
         # Use local cache only (Docker runs with --network=none)
@@ -1237,6 +1239,41 @@ def _load_model(model_path: str, use_random_init: bool = False):
 def _count_model_params(model: torch.nn.Module) -> int:
     """Count total parameters in model."""
     return sum(p.numel() for p in model.parameters())
+
+
+def _count_active_params(model: torch.nn.Module) -> int:
+    """Count active parameters per forward pass (for MFU calculation).
+
+    For MoE models only a subset of experts fire per token, so the
+    effective FLOPs depend on active (not total) parameters.  For dense
+    models this returns the same value as ``_count_model_params``.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return _count_model_params(model)
+
+    num_experts = getattr(config, "num_experts", None)
+    num_experts_per_tok = getattr(config, "num_experts_per_tok", None)
+
+    if not num_experts or not num_experts_per_tok or num_experts <= 1:
+        return _count_model_params(model)
+
+    total_params = _count_model_params(model)
+
+    expert_params = 0
+    for name, param in model.named_parameters():
+        if "experts" in name:
+            expert_params += param.numel()
+
+    active_expert_params = expert_params * num_experts_per_tok // num_experts
+    non_expert_params = total_params - expert_params
+
+    active = non_expert_params + active_expert_params
+    logger.info(
+        f"MoE active params: {active:,} / {total_params:,} total "
+        f"({num_experts_per_tok}/{num_experts} experts active)"
+    )
+    return active
 
 
 def _calculate_mfu(
@@ -1406,7 +1443,12 @@ def _get_cached_model(model_path: str, use_random_init: bool = False):
     _CACHE["model_path"] = model_path
     _CACHE["use_random_init"] = use_random_init
     _CACHE["model_tokenizer"] = tokenizer_name
-    _CACHE["initial_state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    if _LOCAL_RANK == 0:
+        _CACHE["initial_state"] = {
+            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+        }
+    else:
+        _CACHE["initial_state"] = None
     return model
 
 
@@ -1446,18 +1488,21 @@ def _create_data_iterator(
 
 
 def _create_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
-    """Create standard AdamW optimizer (fused on CUDA for performance)."""
-    use_fused = torch.cuda.is_available()
-    return torch.optim.AdamW(
+    """Create SGD optimizer for memory safety with large MoE models.
+
+    A 30B-parameter MoE in bf16 already consumes ~61 GB; AdamW's fp32
+    momentum+variance would add another ~244 GB (61 GB/GPU with FSDP-4).
+    SGD has zero extra state, keeping peak memory well within 80 GB.
+    """
+    return torch.optim.SGD(
         model.parameters(),
-        lr=1e-4,
+        lr=0.1,
         weight_decay=0.1,
-        betas=(0.9, 0.95),
-        fused=use_fused,
+        momentum=0.0,
     )
 
 
-_REFERENCE_MICRO_BATCH_SIZE = 2
+_REFERENCE_MICRO_BATCH_SIZE = 1
 
 
 def _run_reference(
@@ -1487,7 +1532,7 @@ def _run_reference(
     _enforce_backend_state()
 
     eval_model = ddp_model if ddp_model is not None else model
-    use_no_sync = hasattr(eval_model, "no_sync")
+    use_no_sync = False
     mbs = _REFERENCE_MICRO_BATCH_SIZE
 
     total_tokens = 0
@@ -1508,11 +1553,18 @@ def _run_reference(
             input_ids = mb[:, :-1]
             labels = mb[:, 1:]
 
+            if step == 0 and idx == 0 and torch.cuda.is_available():
+                logger.info(f"[REF] pre-fwd VRAM={torch.cuda.memory_allocated() / 1e9:.2f}GB")
+
             sync_ctx = (
                 eval_model.no_sync() if use_no_sync and idx < num_accum - 1 else nullcontext()
             )
             with sync_ctx:
                 outputs = eval_model(input_ids)
+
+                if step == 0 and idx == 0 and torch.cuda.is_available():
+                    logger.info(f"[REF] post-fwd VRAM={torch.cuda.memory_allocated() / 1e9:.2f}GB")
+
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs
                 loss = _real_cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
@@ -1520,6 +1572,9 @@ def _run_reference(
                     ignore_index=-100,
                 )
                 (loss / num_accum).backward()
+
+            if step == 0 and idx == 0 and torch.cuda.is_available():
+                logger.info(f"[REF] post-bwd VRAM={torch.cuda.memory_allocated() / 1e9:.2f}GB")
 
             step_logits = logits
             step_loss_sum += float(loss.item())
@@ -1940,14 +1995,16 @@ class Actor:
                     "success": False,
                     "error": (
                         "Multi-GPU evaluation requires get_strategy() in train.py "
-                        'returning "ddp"/"fsdp"/"tp" or {"dp_size": N, "tp_size": M}'
+                        'returning "ddp"/"fsdp"/"tp" or '
+                        '{"dp_size": N, "tp_size": M, "ep_size": E}'
                     ),
                     "seed": seed,
                     "code": code,
                 }
             par_config = ParallelismConfig(dp_size=1, tp_size=1)
 
-        if par_config.dp_size * par_config.tp_size != num_gpus:
+        product = par_config.dp_size * par_config.tp_size * par_config.ep_size
+        if product != num_gpus:
             return {
                 "task_id": task_id,
                 "mfu": 0.0,
@@ -1957,17 +2014,19 @@ class Actor:
                 "success": False,
                 "error": (
                     f"dp_size({par_config.dp_size}) * tp_size({par_config.tp_size}) "
-                    f"= {par_config.dp_size * par_config.tp_size} != num_gpus({num_gpus})"
+                    f"* ep_size({par_config.ep_size}) "
+                    f"= {product} != num_gpus({num_gpus})"
                 ),
                 "seed": seed,
                 "code": code,
             }
 
         logger.info(
-            f"Miner parallelism: dp_size={par_config.dp_size}, tp_size={par_config.tp_size}"
+            f"Miner parallelism: dp_size={par_config.dp_size}, "
+            f"tp_size={par_config.tp_size}, ep_size={par_config.ep_size}"
         )
 
-        data_rank = _LOCAL_RANK // par_config.tp_size if _multi_gpu else 0
+        data_rank = _LOCAL_RANK // (par_config.tp_size * par_config.ep_size) if _multi_gpu else 0
         data_world = par_config.dp_size if _multi_gpu else 1
 
         try:
@@ -1983,8 +2042,10 @@ class Actor:
             # Load model and data
             _log_vram("before-model-load")
             model = _get_cached_model(model_url, use_random_init=use_random_init)
-            model_params = model_params_override or _count_model_params(model)
-            logger.info(f"Model loaded: {model_params:,} parameters, random_init={use_random_init}")
+            model_params = model_params_override or _count_active_params(model)
+            logger.info(
+                f"Model loaded: {model_params:,} active parameters (MFU basis), random_init={use_random_init}"
+            )
 
             data = _load_hf_dataset(
                 dataset_name=data_url,
@@ -2032,7 +2093,9 @@ class Actor:
                 import functools
 
                 from torch.distributed.fsdp import (
+                    BackwardPrefetch,
                     FullStateDictConfig,
+                    MixedPrecision,
                     ShardingStrategy,
                     StateDictType,
                 )
@@ -2055,23 +2118,47 @@ class Actor:
                 ):
                     _layer_cls = type(model.transformer.h[0])
 
+                if hasattr(model, "gradient_checkpointing_disable"):
+                    model.gradient_checkpointing_disable()
+                model.config.use_cache = False
+
                 _ref_wrap_policy = (
                     functools.partial(
-                        transformer_auto_wrap_policy, transformer_layer_cls={_layer_cls}
+                        transformer_auto_wrap_policy,
+                        transformer_layer_cls={_layer_cls},
                     )
                     if _layer_cls
                     else None
                 )
 
-                if hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable()
+                model.to("cpu")
+                torch.cuda.empty_cache()
+                logger.info(
+                    f"[VRAM pre-fsdp-wrap] rank={_LOCAL_RANK} "
+                    f"allocated={torch.cuda.memory_allocated() / 1e9:.2f}GB "
+                    f"layer_cls={_layer_cls}"
+                )
 
+                _ref_mp = MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    reduce_dtype=torch.bfloat16,
+                    buffer_dtype=torch.bfloat16,
+                )
                 ref_fsdp = FSDP(
                     model,
                     auto_wrap_policy=_ref_wrap_policy,
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    mixed_precision=_ref_mp,
                     device_id=torch.device(f"cuda:{_LOCAL_RANK}"),
                     forward_prefetch=True,
+                    backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                )
+
+                _fsdp_units = sum(1 for m in ref_fsdp.modules() if isinstance(m, FSDP))
+                logger.info(
+                    f"[VRAM post-fsdp-wrap] rank={_LOCAL_RANK} "
+                    f"allocated={torch.cuda.memory_allocated() / 1e9:.2f}GB "
+                    f"fsdp_units={_fsdp_units}"
                 )
                 optimizer_ref = _create_optimizer(ref_fsdp)
 
@@ -2942,7 +3029,11 @@ class Actor:
             # Diagnostics
             diagnostics = {
                 "verification": verify_details,
-                "strategy": {"dp_size": par_config.dp_size, "tp_size": par_config.tp_size},
+                "strategy": {
+                    "dp_size": par_config.dp_size,
+                    "tp_size": par_config.tp_size,
+                    "ep_size": par_config.ep_size,
+                },
                 "reference_loss": reference.final_loss,
                 "candidate_loss": parsed.final_loss,
                 "expected_tokens": expected_tokens,
